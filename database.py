@@ -7,7 +7,8 @@ import random
 import string
 from datetime import datetime
 
-DB_PATH = "bot/links.db"
+import os as _os
+DB_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "links.db")
 
 
 def _connect() -> sqlite3.Connection:

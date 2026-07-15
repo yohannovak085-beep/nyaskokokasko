@@ -753,5 +753,6 @@ def handle_conversation(message: Message) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    bot.remove_webhook()
     logger.info("Bot started. Polling…")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
