@@ -31,7 +31,7 @@ import database
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = "8991743492:AAGQGctQYsg6jPSG9crrww6AbLQf57foy1s"
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "")
 
 if not BOT_TOKEN:
