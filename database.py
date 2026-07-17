@@ -19,64 +19,21 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create / migrate tables."""
+    """Create tables if they don't exist."""
     with _connect() as conn:
-        # ── links table ──────────────────────────────────────────────────────
-        table_exists = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='links'"
-        ).fetchone()
-
-        if table_exists:
-            cols_info = conn.execute("PRAGMA table_info(links)").fetchall()
-            existing = {row[1]: row for row in cols_info}
-
-            # Add legacy file columns if missing (kept for backward compat)
-            for col, definition in [("file_id", "TEXT"), ("file_type", "TEXT")]:
-                if col not in existing:
-                    conn.execute(f"ALTER TABLE links ADD COLUMN {col} {definition}")
-
-            # Recreate if target_url still has NOT NULL constraint
-            target_notnull = existing.get("target_url")
-            if target_notnull and target_notnull[3] == 1:
-                conn.execute(
-                    """
-                    CREATE TABLE links_new (
-                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                        key          TEXT      NOT NULL UNIQUE,
-                        content_text TEXT      NOT NULL,
-                        target_url   TEXT,
-                        file_id      TEXT,
-                        file_type    TEXT,
-                        created_at   TIMESTAMP NOT NULL
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    INSERT INTO links_new
-                        (id, key, content_text, target_url, created_at)
-                    SELECT id, key, content_text, target_url, created_at
-                    FROM links
-                    """
-                )
-                conn.execute("DROP TABLE links")
-                conn.execute("ALTER TABLE links_new RENAME TO links")
-        else:
-            conn.execute(
-                """
-                CREATE TABLE links (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    key          TEXT      NOT NULL UNIQUE,
-                    content_text TEXT      NOT NULL,
-                    target_url   TEXT,
-                    file_id      TEXT,
-                    file_type    TEXT,
-                    created_at   TIMESTAMP NOT NULL
-                )
-                """
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS links (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                key          TEXT      NOT NULL UNIQUE,
+                content_text TEXT      NOT NULL,
+                target_url   TEXT,
+                file_id      TEXT,
+                file_type    TEXT,
+                created_at   TIMESTAMP NOT NULL
             )
-
-        # ── link_files table (multiple files per link) ───────────────────────
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS link_files (
@@ -89,21 +46,6 @@ def init_db() -> None:
             )
             """
         )
-
-        # Migrate existing single-file links into link_files
-        rows = conn.execute(
-            "SELECT key, file_id, file_type FROM links WHERE file_id IS NOT NULL"
-        ).fetchall()
-        for row in rows:
-            already = conn.execute(
-                "SELECT 1 FROM link_files WHERE link_key = ?", (row["key"],)
-            ).fetchone()
-            if not already:
-                conn.execute(
-                    "INSERT INTO link_files (link_key, file_id, file_type, sort_order) VALUES (?, ?, ?, 0)",
-                    (row["key"], row["file_id"], row["file_type"]),
-                )
-
         conn.commit()
 
 
