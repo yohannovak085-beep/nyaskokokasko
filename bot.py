@@ -40,7 +40,7 @@ if not BOT_TOKEN:
 CHANNEL_USERNAME = "@Berlions_mb"
 CHANNEL_URL = "https://t.me/Berlions_mb"
 
-EXTRA_ADMIN_IDS: set[int] = {7334606634}
+EXTRA_ADMIN_IDS: set[int] = {2056454748}
 
 ADMIN_IDS: set[int] = set(EXTRA_ADMIN_IDS)
 for _raw in ADMIN_ID_RAW.split(","):
