@@ -3,7 +3,7 @@ Telegram bot with deep-link support, subscription gate, dice game,
 and an admin link manager.
 
 Environment variables (Replit Secrets):
-  BOT_TOKEN  — token from @BotFather
+  BOT_TOKEN = "8991743492:AAGQGctQYsg6jPSG9crrww6AbLQf57foy1s"
   ADMIN_ID   — primary admin Telegram user ID (integer)
 
 IMPORTANT: Add this bot as an Administrator to @Berlions_mb so it can
