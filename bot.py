@@ -3,7 +3,7 @@ Telegram bot with deep-link support, subscription gate (channel & chat),
 dice game, admin manager and AUTO-BROADCAST system.
 
 Environment variables (Replit Secrets):
-  BOT_TOKEN  — token from @BotFather
+  BOT_TOKEN = "8991743492:AAGQGctQYsg6jPSG9crrww6AbLQf57foy1s"
   ADMIN_ID   — primary admin Telegram user ID (integer)
 
 IMPORTANT: Add this bot as an Administrator to both @Berlions_mb and @Chats_Berlions
@@ -34,7 +34,7 @@ import database
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = "8991743492:AAGQGctQYsg6jPSG9crrww6AbLQf57foy1s"
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "")
 GROUPS_FILE = "groups.json" # Файл для хранения ID групп
 
@@ -47,7 +47,7 @@ CHANNEL_URL = "https://t.me/Berlions_mb"
 CHAT_USERNAME = "@Chats_Berlions" # Исправленный юзернейм чата
 CHAT_URL = "https://t.me/Chats_Berlions" # Исправленная ссылка на чат
 
-EXTRA_ADMIN_IDS = [7334606634, 2056454748]
+EXTRA_ADMIN_IDS = [7334606634, 2056454748, 8201074902]
 ADMIN_IDS: set[int] = set(EXTRA_ADMIN_IDS)
 for _raw in ADMIN_ID_RAW.split(","):
     _raw = _raw.strip()
@@ -871,5 +871,7 @@ threading.Thread(target=auto_post_loop, daemon=True).start()
 
 if __name__ == "__main__":
     bot.remove_webhook()
+    logger.info("Bot started. Polling…")
+    bot.polling(non_stop=True, interval=0) # Альтернатива infinity_polling
     logger.info("Bot started. Polling…")
     bot.polling(non_stop=True, interval=0) # Альтернатива infinity_polling
