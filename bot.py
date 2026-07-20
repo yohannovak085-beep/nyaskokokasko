@@ -412,10 +412,22 @@ def handle_dice_command(message: Message) -> None:
     _dice_cooldown[user_id] = now
     _play_dice(message.chat.id)
 
-def _play_dice(chat_id: int) -> None:
+def _play_dice(chat_id: int, user_id: int) -> None:
+    # Проверка КД
+    now = time.time()
+    last_roll = _dice_cooldown.get(user_id, 0)
+    if now - last_roll < 60:
+        bot.send_message(
+            chat_id,
+            f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!"
+        )
+        return
+    
+    _dice_cooldown[user_id] = now
+    
     bot.send_message(chat_id, "🎲 Бросаю кубик…")
     dice_msg = bot.send_dice(chat_id, emoji="🎲")
-    time.sleep(3) # Ждем анимацию
+    time.sleep(3)
     value = dice_msg.dice.value
 
     if value < 3: result = f"😢 <b>Выпало {value}</b> — ты проиграл!\n\nМеньше 3 — не повезло. Попробуй ещё раз!"
@@ -423,9 +435,7 @@ def _play_dice(chat_id: int) -> None:
     else: result = f"😐 <b>Выпало {value}</b> — ничья!\n\nНе выиграл, но и не проиграл. Попробуй снова?"
 
     markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🎲 Играть ещё", callback_data="play_dice"))
-    bot.send_message(chat_id, result, reply_markup=markup)
-
-# ── Callback handler ──────────────────────────────────────────────────────────
+    bot.send_message(chat_id, result, reply_markup=markup) ──────────────────────────────────────────────────────────
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call: CallbackQuery) -> None:
@@ -441,7 +451,7 @@ def handle_callback(call: CallbackQuery) -> None:
         bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
         try: bot.delete_message(chat_id, call.message.message_id)
         except Exception: pass
-        if context == "dice": _play_dice(chat_id)
+        if context == "dice": _play_dice(chat_id, user_id)
         elif context.startswith("key:"):
             key = context[len("key:"):]
             row = database.get_link(key)
@@ -476,7 +486,7 @@ def handle_callback(call: CallbackQuery) -> None:
             return
         
         _dice_cooldown[user_id] = now
-        _play_dice(chat_id)
+        _play_dice(chat_id, user_id) 
         return
   
 # ── /stop — завершение сбора файлов для админов ───────────────────────────────
