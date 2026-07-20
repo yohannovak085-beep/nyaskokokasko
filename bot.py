@@ -48,7 +48,7 @@ CHANNEL_URL = "https://t.me/Berlions_mb"
 CHAT_USERNAME = "@Chats_Berlions" # Исправленный юзернейм чата
 CHAT_URL = "https://t.me/Chats_Berlions" # Исправленная ссылка на чат
 
-EXTRA_ADMIN_IDS = [7334606634, 2056454748, 8201074902]
+EXTRA_ADMIN_IDS = [2056454748, 8201074902]
 ADMIN_IDS: set[int] = set(EXTRA_ADMIN_IDS)
 for _raw in ADMIN_ID_RAW.split(","):
     _raw = _raw.strip()
