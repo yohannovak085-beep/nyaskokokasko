@@ -30,6 +30,7 @@ from telebot.apihelper import ApiTelegramException
 
 import database
 
+_dice_cooldown: dict[int, float] = {}
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 load_dotenv()
@@ -393,7 +394,22 @@ def handle_search(message: Message) -> None:
 
 @bot.message_handler(commands=["dice"])
 def handle_dice_command(message: Message) -> None:
-    if not _require_subscription(message.chat.id, message.from_user.id, "dice"): return
+    user_id = message.from_user.id
+    now = time.time()
+    last_roll = _dice_cooldown.get(user_id, 0)
+    
+    # КД 60 секунд
+    if now - last_roll < 60:
+        bot.send_message(
+            message.chat.id,
+            f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!"
+        )
+        return
+    
+    if not _require_subscription(message.chat.id, user_id, "dice"):
+        return
+    
+    _dice_cooldown[user_id] = now
     _play_dice(message.chat.id)
 
 def _play_dice(chat_id: int) -> None:
@@ -862,7 +878,7 @@ def auto_post_loop():
         else:
             logger.info("Автопостинг пропущен: нет сохраненных групп.")
             
-        time.sleep(18000)  # 5 часов в секундах
+        time.sleep(36000)  # 10 часов в секундах
 
 # Запуск автопостинга в фоне
 threading.Thread(target=auto_post_loop, daemon=True).start()
@@ -872,6 +888,4 @@ threading.Thread(target=auto_post_loop, daemon=True).start()
 if __name__ == "__main__":
     bot.remove_webhook()
     logger.info("Bot started. Polling…")
-    bot.polling(non_stop=True, interval=0) # Альтернатива infinity_polling
-    logger.info("Bot started. Polling…")
-    bot.polling(non_stop=True, interval=0) # Альтернатива infinity_polling
+    bot.polling(non_stop=True, interval=0)
