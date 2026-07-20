@@ -435,7 +435,7 @@ def _play_dice(chat_id: int, user_id: int) -> None:
     else: result = f"😐 <b>Выпало {value}</b> — ничья!\n\nНе выиграл, но и не проиграл. Попробуй снова?"
 
     markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🎲 Играть ещё", callback_data="play_dice"))
-    bot.send_message(chat_id, result, reply_markup=markup) ──────────────────────────────────────────────────────────
+    bot.send_message(chat_id, result, reply_markup=markup) 
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call: CallbackQuery) -> None:
