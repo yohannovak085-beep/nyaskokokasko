@@ -461,12 +461,24 @@ def handle_callback(call: CallbackQuery) -> None:
 
     if call.data == "play_dice":
         bot.answer_callback_query(call.id)
-        if not _require_subscription(chat_id, user_id, "dice"): return
+        
+        # Проверка КД для кнопки
+        now = time.time()
+        last_roll = _dice_cooldown.get(user_id, 0)
+        if now - last_roll < 60:
+            bot.send_message(
+                chat_id,
+                f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!"
+            )
+            return
+        
+        if not _require_subscription(chat_id, user_id, "dice"):
+            return
+        
+        _dice_cooldown[user_id] = now
         _play_dice(chat_id)
         return
-
-    bot.answer_callback_query(call.id) # Отвечаем на любой другой колбэк, чтобы кнопка не висела
-
+  
 # ── /stop — завершение сбора файлов для админов ───────────────────────────────
 
 @bot.message_handler(commands=["stop"])
