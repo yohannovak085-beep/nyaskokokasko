@@ -12,9 +12,8 @@ so it can check member status via getChatMember.
 
 import os
 import time
+import html
 import logging
-import threading
-import json  # Для сохранения и загрузки списка групп
 from dotenv import load_dotenv
 import telebot
 from telebot.types import (
@@ -73,37 +72,6 @@ database.init_db()
 
 _pending: dict[int, dict] = {}
 _stupid_stats: dict[int, dict] = {} # пока не используется, но оставлено по структуре
-
-# ── Groups Management (Автосбор ID групп) ─────────────────────────────────────
-
-def _load_groups() -> set:
-    """Загружает список chat_id групп из файла."""
-    if not os.path.exists(GROUPS_FILE):
-        return set()
-    try:
-        with open(GROUPS_FILE, "r") as f:
-            return set(json.load(f))
-    except Exception as e:
-        logger.error("Ошибка загрузки групп из файла: %s", e)
-        return set()
-
-def _save_group(chat_id: int):
-    """Сохраняет новый chat_id группы в файл, если его там еще нет."""
-    groups = _load_groups()
-    if chat_id not in groups:
-        groups.add(chat_id)
-        try:
-            with open(GROUPS_FILE, "w") as f:
-                json.dump(list(groups), f)
-            logger.info("Сохранен новый chat_id группы: %s", chat_id)
-        except Exception as e:
-            logger.error("Ошибка сохранения chat_id группы: %s", e)
-
-# Используем middleware правильно — оно выполняется в фоне и не мешает командам!
-@bot.middleware_handler(update_types=['message'])
-def capture_groups_middleware(bot_instance, message: Message):
-    if message.chat.type in ("group", "supergroup"):
-        _save_group(message.chat.id)
 
 # ── Subscription gate (Двойная проверка подписки на канал И чат) ───────────────
 
@@ -268,11 +236,17 @@ def handle_start(message: Message) -> None:
         
         user_display = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
         
+        user_display = html.escape(str(user_display))
         welcome_text = (
-            f"😈 <b>Приветствую тебя, {user_display}!</b>\n\n"
-            f"Давно искал игры но не мог найти? Не беда 👁️‍🗨️\n"
-            f"Пиши любую игру (хоть та которая на ПК) просто напиши <code>/search игра</code>\n\n"
-            f"Для вызова команд напиши /help"
+            f"👋 <b>Привет! Я Berlions чат-бот.</b>\n\n"
+            f"📋 <b>Доступные команды:</b>\n"
+            f"• /start — приветствие и главное меню\n"
+            f"• /help — список доступных команд\n"
+            f"• /search <i>запрос</i> — поиск игры или контента\n"
+            f"• /dice — сыграть в кости 🎲\n\n"
+            f"🔍 <b>Поиск:</b>\n"
+            f"Например: <code>/search standoff 2</code>\n\n"
+            f"🎲 Нажми кнопку ниже, чтобы сразу сыграть."
         )
         
         bot.send_message(message.chat.id, welcome_text, reply_markup=markup)
@@ -298,9 +272,11 @@ def handle_help(message: Message) -> None:
     bot.send_message(
         message.chat.id,
         "📋 <b>Доступные команды:</b>\n\n"
-        "• /start — приветствие и игра в кости\n"
-        "• /search <i>запрос</i> — поиск контента (например, /search minecraft)\n"
-        "• /dice — сыграть в кости\n",
+        "• /start — главное меню\n"
+        "• /help — список доступных команд\n"
+        "• /search <i>запрос</i> — поиск контента\n"
+        "• /dice — сыграть в кости 🎲\n\n"
+        "Пример поиска: <code>/search minecraft</code>",
         reply_markup=markup,
     )
 
@@ -349,7 +325,7 @@ def handle_search(message: Message) -> None:
             chat_id=message.chat.id,
             message_id=loader_msg.message_id,
             text=f"<code>> SEARCH FAILED</code>\n\n"
-                 f"😔 По запросу <b>«{query}»</b> ничего не найдено.\n\n"
+                 f"😔 По запросу <b>«{html.escape(query)}»</b> ничего не найдено.\n\n"
                  f"Попробуй другое название."
         )
         return
@@ -385,7 +361,7 @@ def handle_search(message: Message) -> None:
         text=f"<code>> DATABASE UNLOCKED</code>\n"
              f"<code>[██████████████] 100%</code>\n\n"
              f"🔑 <b>НАШЁЛ!</b>\n\n"
-             f"🔍 Результатов по запросу «{query}»: <b>{count}</b>\n"
+             f"🔍 Результатов по запросу «{html.escape(query)}»: <b>{count}</b>\n"
              f"Выбери что тебя интересует 👇",
         reply_markup=markup
     )
@@ -409,33 +385,54 @@ def handle_dice_command(message: Message) -> None:
     if not _require_subscription(message.chat.id, user_id, "dice"):
         return
     
-    _dice_cooldown[user_id] = now
-    _play_dice(message.chat.id)
+    _play_dice(message.chat.id, user_id)
 
 def _play_dice(chat_id: int, user_id: int) -> None:
-    # Проверка КД
+    """Запускает бросок кубика и применяет cooldown."""
     now = time.time()
     last_roll = _dice_cooldown.get(user_id, 0)
+
+    # КД проверяется здесь, чтобы команда и кнопка использовали одну логику.
     if now - last_roll < 60:
         bot.send_message(
             chat_id,
             f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!"
         )
         return
-    
+
+    # Ставим cooldown только непосредственно перед реальным броском.
     _dice_cooldown[user_id] = now
-    
-    bot.send_message(chat_id, "🎲 Бросаю кубик…")
-    dice_msg = bot.send_dice(chat_id, emoji="🎲")
-    time.sleep(3)
-    value = dice_msg.dice.value
 
-    if value < 3: result = f"😢 <b>Выпало {value}</b> — ты проиграл!\n\nМеньше 3 — не повезло. Попробуй ещё раз!"
-    elif value > 5: result = f"🏆 <b>Выпало {value}</b> — ты победил!\n\nМаксимум! Ты настоящий везунчик 🎉"
-    else: result = f"😐 <b>Выпало {value}</b> — ничья!\n\nНе выиграл, но и не проиграл. Попробуй снова?"
+    try:
+        dice_msg = bot.send_dice(chat_id, emoji="🎲")
+        value = dice_msg.dice.value
+    except Exception:
+        # Если Telegram не принял бросок, не наказываем пользователя cooldown'ом.
+        _dice_cooldown.pop(user_id, None)
+        logger.exception("Не удалось отправить кубик в чат %s", chat_id)
+        bot.send_message(chat_id, "❌ Не удалось бросить кубик. Попробуй ещё раз.")
+        return
 
-    markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🎲 Играть ещё", callback_data="play_dice"))
-    bot.send_message(chat_id, result, reply_markup=markup) 
+    if value < 3:
+        result = (
+            f"😢 <b>Выпало {value}</b> — ты проиграл!\n\n"
+            f"Меньше 3 — не повезло. Попробуй ещё раз!"
+        )
+    elif value > 5:
+        result = (
+            f"🏆 <b>Выпало {value}</b> — ты победил!\n\n"
+            f"Максимум! Ты настоящий везунчик 🎉"
+        )
+    else:
+        result = (
+            f"😐 <b>Выпало {value}</b> — ничья!\n\n"
+            f"Не выиграл, но и не проиграл. Попробуй снова?"
+        )
+
+    markup = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("🎲 Играть ещё", callback_data="play_dice")
+    )
+    bot.send_message(chat_id, result, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call: CallbackQuery) -> None:
@@ -485,8 +482,7 @@ def handle_callback(call: CallbackQuery) -> None:
         if not _require_subscription(chat_id, user_id, "dice"):
             return
         
-        _dice_cooldown[user_id] = now
-        _play_dice(chat_id, user_id) 
+        _play_dice(chat_id, user_id)
         return
   
 # ── /stop — завершение сбора файлов для админов ───────────────────────────────
@@ -695,8 +691,12 @@ def _get_user_rank(chat_id: int, user_id: int) -> int:
         try:
             admins = database.get_chat_admins(chat_id)
             for row in admins:
-                uid, rank = row[0], row[1] if isinstance(row, (list, tuple)) else (row["user_id"], row["rank"])
-                if int(uid) == int(user_id): return int(rank)
+                if isinstance(row, (list, tuple)):
+                    uid, rank = row[0], row[1]
+                else:
+                    uid, rank = row["user_id"], row["rank"]
+                if int(uid) == int(user_id):
+                    return int(rank)
         except Exception as e:
             logger.debug(f"Ошибка при получении ранга из БД: {e}")
     return 0
@@ -738,7 +738,10 @@ def handle_rank(message: Message) -> None:
         return
     lines = ["<b>👮 Админы чата:</b>\n"]
     for row in admins:
-        uid, rank = row[0], row[1] if isinstance(row, (list, tuple)) else (row["user_id"], row["rank"])
+        if isinstance(row, (list, tuple)):
+            uid, rank = row[0], row[1]
+        else:
+            uid, rank = row["user_id"], row["rank"]
         lines.append(f"• User_{uid} — {RANK_NAMES.get(rank, f'Ранг {rank}')}")
     bot.send_message(chat_id, "\n".join(lines))
 
@@ -846,64 +849,8 @@ def handle_learn(message: Message) -> None:
         return
     bot.send_message(message.chat.id, "✅ /learn активирован. Полная история чата пока не поддерживается (ограничения Telegram).")
 
-# ── Auto Posting & Manual Post (Система рекламы) ──────────────────────────────
-
-AD_TEXT = (
-    "👀 <b>Ищешь годные игры на телефон, но не можешь найти!?</b>\n\n"
-    "<b>Berlions</b> - это канал, в котором ты сможешь найти:\n"
-    "• Качественные порты и годные игры, а главное - всё без вирусов и бесплатно.\n\n"
-    "☄️ <b>Berlions</b> - твой проводник в мобильный гейминг.\n"
-    "https://t.me/Berlions_mb"
-)
-
-# Ручной запуск рассылки по всем группам (/post)
-@bot.message_handler(commands=["post"])
-def handle_manual_post(message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "⛔️ Не майся фигней, команда только для админов.")
-        return
-    
-    groups = _load_groups()
-    if not groups:
-        bot.send_message(message.chat.id, "⚠️ Бот пока не зафиксировал ни одной группы. Напиши что-нибудь в чатах с ботом.")
-        return
-
-    success_count = 0
-    for chat_id in groups:
-        try:
-            bot.send_message(chat_id, AD_TEXT, disable_web_page_preview=True)
-            success_count += 1
-            time.sleep(0.5)  # Защита от спам-фильтра Telegram
-        except Exception as e:
-            logger.warning("Не удалось отправить в чат %s: %s", chat_id, e)
-            
-    bot.send_message(message.chat.id, f"✅ Реклама успешно отправлена в {success_count} чат(ов)!")
-
-# Автопостинг раз в 5 часов по всем сохраненным группам
-def auto_post_loop():
-    time.sleep(10) # Небольшая пауза при запуске бота
-    while True:
-        groups = _load_groups()
-        if groups:
-            logger.info("Запуск автопостинга по %s чатам...", len(groups))
-            for chat_id in groups:
-                try:
-                    # Проверяем, что это не личный чат (для безопасности)
-                    chat_info = bot.get_chat(chat_id)
-                    if chat_info.type in ("group", "supergroup"):
-                        bot.send_message(chat_id, AD_TEXT, disable_web_page_preview=True)
-                        time.sleep(0.5) # Защита от спам-фильтра
-                    else:
-                        logger.debug("Пропущен личный чат: %s", chat_id)
-                except Exception as e:
-                    logger.warning("Ошибка автопостинга в чат %s: %s", chat_id, e)
-        else:
-            logger.info("Автопостинг пропущен: нет сохраненных групп.")
-            
-        time.sleep(36000)  # 10 часов в секундах
-
-# Запуск автопостинга в фоне
-threading.Thread(target=auto_post_loop, daemon=True).start()
+# ── Advertising/autopost ───────────────────────────────────────────────────────
+# Автопостинг рекламы удалён по запросу. Остальная логика бота не зависит от него.
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
