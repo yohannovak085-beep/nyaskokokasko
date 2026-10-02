@@ -366,6 +366,515 @@ def handle_search(message: Message) -> None:
         reply_markup=markup
     )
 
+# ── BERLIONS EXCHANGE SYSTEM ───────────────────────────────────────────────────
+# Отдельный функциональный блок. Старые функции бота не изменяет.
+
+import sqlite3
+import random
+from datetime import datetime, date
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:
+    matplotlib = None
+    plt = None
+
+EXCHANGE_DB = "exchange.db"
+EXCHANGE_GRAPH_DIR = "exchange_graphs"
+EXCHANGE_START_BALANCE = 10_000.0
+EXCHANGE_DAILY_BONUS = 1_000.0
+EXCHANGE_DEFAULT_PRICE = 100.0
+EXCHANGE_DEFAULT_TICKER = "BERL"
+EXCHANGE_MAX_TRADE = 100_000
+
+
+def _ex_db():
+    conn = sqlite3.connect(EXCHANGE_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ex_init_db():
+    conn = _ex_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS ex_traders (
+        user_id INTEGER PRIMARY KEY,
+        balance REAL NOT NULL DEFAULT 10000,
+        last_bonus TEXT,
+        market_message_id INTEGER,
+        market_chat_id INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS ex_exchanges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        ticker TEXT NOT NULL UNIQUE,
+        price REAL NOT NULL DEFAULT 100,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ex_holdings (
+        user_id INTEGER NOT NULL,
+        exchange_id INTEGER NOT NULL,
+        shares INTEGER NOT NULL DEFAULT 0,
+        avg_price REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, exchange_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ex_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        exchange_id INTEGER NOT NULL,
+        price REAL NOT NULL,
+        ts TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ex_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        exchange_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        shares INTEGER NOT NULL,
+        price REAL NOT NULL,
+        total REAL NOT NULL,
+        ts TEXT NOT NULL
+    );
+    """)
+
+    # Базовая биржа Berlions.
+    row = conn.execute("SELECT id FROM ex_exchanges WHERE ticker=?", (EXCHANGE_DEFAULT_TICKER,)).fetchone()
+    if row is None:
+        cur = conn.execute(
+            "INSERT INTO ex_exchanges(owner_id,name,ticker,price,created_at) VALUES(?,?,?,?,?)",
+            (0, "Berlions", EXCHANGE_DEFAULT_TICKER, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
+        )
+        exchange_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)",
+            (exchange_id, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
+        )
+    conn.commit()
+    conn.close()
+
+
+_ex_init_db()
+
+
+def _ex_ensure_trader(user_id: int):
+    conn = _ex_db()
+    conn.execute("INSERT OR IGNORE INTO ex_traders(user_id,balance) VALUES(?,?)", (user_id, EXCHANGE_START_BALANCE))
+    conn.commit()
+    row = conn.execute("SELECT * FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def _ex_escape(value):
+    return html.escape(str(value))
+
+
+def _ex_change_price(conn, exchange_id: int, action_bias: float = 0.0):
+    row = conn.execute("SELECT price FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
+    if not row:
+        return None, 0.0
+
+    old_price = float(row["price"])
+    shock = random.gauss(0, 0.035) + action_bias
+    shock = max(-0.12, min(0.12, shock))
+    new_price = max(1.0, old_price * (1.0 + shock))
+
+    conn.execute("UPDATE ex_exchanges SET price=? WHERE id=?", (new_price, exchange_id))
+    conn.execute(
+        "INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)",
+        (exchange_id, new_price, datetime.now().isoformat(timespec="seconds")),
+    )
+    return new_price, ((new_price / old_price) - 1.0) * 100.0
+
+
+def _ex_chart(exchange_id: int):
+    if plt is None:
+        raise RuntimeError("Для графиков нужна библиотека matplotlib. Установи: pip install matplotlib")
+
+    import os
+    os.makedirs(EXCHANGE_GRAPH_DIR, exist_ok=True)
+    conn = _ex_db()
+    ex = conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
+    rows = conn.execute(
+        "SELECT price,ts FROM ex_history WHERE exchange_id=? ORDER BY id DESC LIMIT 40",
+        (exchange_id,),
+    ).fetchall()
+    conn.close()
+
+    rows = list(reversed(rows))
+    prices = [float(r["price"]) for r in rows] or [float(ex["price"])]
+    if len(prices) > 1 and prices[0] != 0:
+        change = (prices[-1] / prices[0] - 1.0) * 100.0
+    else:
+        change = 0.0
+
+    fig, ax = plt.subplots(figsize=(10, 5.4), dpi=130)
+    ax.plot(range(len(prices)), prices, linewidth=2.5)
+    ax.fill_between(range(len(prices)), prices, min(prices) * 0.995, alpha=0.12)
+    ax.grid(True, alpha=0.22)
+    ax.set_title(f"{ex['name']}  •  {ex['ticker']}   {prices[-1]:,.2f} ₽   ({change:+.2f}%)")
+    ax.set_xlabel("Движение рынка")
+    ax.set_ylabel("Цена, ₽")
+    fig.tight_layout()
+
+    path = os.path.join(EXCHANGE_GRAPH_DIR, f"market_{exchange_id}.png")
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _ex_market_text(exchange_id: int):
+    conn = _ex_db()
+    ex = conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
+    owner = conn.execute("SELECT user_id FROM ex_traders WHERE user_id=?", (ex["owner_id"],)).fetchone()
+    hist = conn.execute(
+        "SELECT price FROM ex_history WHERE exchange_id=? ORDER BY id DESC LIMIT 2",
+        (exchange_id,),
+    ).fetchall()
+    conn.close()
+
+    current = float(ex["price"])
+    previous = float(hist[1]["price"]) if len(hist) > 1 else current
+    change = ((current / previous) - 1.0) * 100 if previous else 0.0
+    arrow = "📈" if change > 0 else "📉" if change < 0 else "➖"
+
+    return (
+        f"🏦 <b>{_ex_escape(ex['name'])}</b>  <code>${_ex_escape(ex['ticker'])}</code>\n"
+        f"💰 Цена: <b>{current:,.2f} ₽</b>\n"
+        f"{arrow} Изменение: <b>{change:+.2f}%</b>\n"
+        f"👤 Владелец: <code>{ex['owner_id']}</code>\n\n"
+        f"/buy {ex['ticker']} 5 — купить\n"
+        f"/sell {ex['ticker']} 5 — продать\n"
+        f"/portfolio — мой портфель"
+    )
+
+
+def _ex_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔄 Обновить рынок", callback_data="ex_refresh"),
+        InlineKeyboardButton("💼 Портфель", callback_data="ex_portfolio"),
+        InlineKeyboardButton("💰 Бонус", callback_data="ex_bonus"),
+    )
+    return markup
+
+
+def _ex_replace_market(chat_id: int, user_id: int, exchange_id: int = 1):
+    _ex_ensure_trader(user_id)
+    conn = _ex_db()
+    ex = conn.execute("SELECT id FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
+    if not ex:
+        exchange_id = 1
+    old = conn.execute(
+        "SELECT market_message_id,market_chat_id FROM ex_traders WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+
+    if old and old["market_message_id"] and old["market_chat_id"]:
+        try:
+            bot.delete_message(old["market_chat_id"], old["market_message_id"])
+        except Exception:
+            pass
+
+    path = _ex_chart(exchange_id)
+    with open(path, "rb") as photo:
+        msg = bot.send_photo(
+            chat_id,
+            photo,
+            caption=_ex_market_text(exchange_id),
+            reply_markup=_ex_markup(),
+        )
+
+    conn = _ex_db()
+    conn.execute(
+        "UPDATE ex_traders SET market_message_id=?,market_chat_id=? WHERE user_id=?",
+        (msg.message_id, chat_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _ex_require_user(message):
+    # Биржа не меняет существующую подписочную логику старых команд.
+    _ex_ensure_trader(message.from_user.id)
+    return True
+
+
+@bot.message_handler(commands=["exchange", "биржа"])
+def handle_exchange(message: Message) -> None:
+    if not _ex_require_user(message):
+        return
+    bot.send_message(
+        message.chat.id,
+        "🏦 <b>BERLIONS STOCK EXCHANGE</b>\n\n"
+        "💰 /bonus — ежедневный бонус 1 000 ₽\n"
+        "💵 /balance — баланс\n"
+        "📈 /market — открыть рынок и график\n"
+        "💼 /portfolio — мои акции\n"
+        "🛒 /buy TICKER 5 — купить акции\n"
+        "💸 /sell TICKER 5 — продать акции\n"
+        "🏭 /create_exchange Название TICKER — создать свою биржу\n"
+        "📋 /exchanges — список бирж\n"
+        "🏆 /top — рейтинг игроков\n\n"
+        "Курс меняется после сделок, а график рынка обновляется автоматически."
+    )
+
+
+@bot.message_handler(commands=["bonus"])
+def handle_exchange_bonus(message: Message) -> None:
+    user_id = message.from_user.id
+    _ex_ensure_trader(user_id)
+    today = date.today().isoformat()
+    conn = _ex_db()
+    row = conn.execute("SELECT balance,last_bonus FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
+    if row["last_bonus"] == today:
+        conn.close()
+        bot.send_message(message.chat.id, "⏳ Ты уже получил ежедневный бонус сегодня. Возвращайся завтра!")
+        return
+    new_balance = float(row["balance"]) + EXCHANGE_DAILY_BONUS
+    conn.execute("UPDATE ex_traders SET balance=?,last_bonus=? WHERE user_id=?", (new_balance, today, user_id))
+    conn.commit()
+    conn.close()
+    bot.send_message(message.chat.id, f"🎁 <b>Ежедневный бонус!</b>\n\n+{EXCHANGE_DAILY_BONUS:,.0f} ₽\n💰 Баланс: <b>{new_balance:,.2f} ₽</b>")
+
+
+@bot.message_handler(commands=["balance"])
+def handle_exchange_balance(message: Message) -> None:
+    row = _ex_ensure_trader(message.from_user.id)
+    bot.send_message(message.chat.id, f"💰 Твой баланс: <b>{float(row['balance']):,.2f} ₽</b>\n\n🎁 Ежедневный бонус: /bonus")
+
+
+@bot.message_handler(commands=["market"])
+def handle_exchange_market(message: Message) -> None:
+    _ex_require_user(message)
+    _ex_replace_market(message.chat.id, message.from_user.id, 1)
+
+
+@bot.message_handler(commands=["portfolio"])
+def handle_exchange_portfolio(message: Message) -> None:
+    user_id = message.from_user.id
+    _ex_ensure_trader(user_id)
+    conn = _ex_db()
+    rows = conn.execute("""
+        SELECT h.shares,h.avg_price,e.name,e.ticker,e.price
+        FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id
+        WHERE h.user_id=? AND h.shares>0 ORDER BY e.ticker
+    """, (user_id,)).fetchall()
+    balance = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()["balance"]
+    conn.close()
+
+    if not rows:
+        bot.send_message(message.chat.id, f"💼 <b>Портфель пуст</b>\n\n💰 Баланс: <b>{float(balance):,.2f} ₽</b>\n\nПопробуй /buy BERL 5")
+        return
+
+    lines = [f"💼 <b>Твой портфель</b>\n💰 Баланс: <b>{float(balance):,.2f} ₽</b>\n"]
+    for r in rows:
+        value = r["shares"] * r["price"]
+        pnl = (r["price"] - r["avg_price"]) * r["shares"]
+        lines.append(f"• <b>{r['ticker']}</b> — {r['shares']} шт. × {r['price']:,.2f} ₽ = {value:,.2f} ₽\n  P/L: {pnl:+,.2f} ₽")
+    bot.send_message(message.chat.id, "\n".join(lines))
+
+
+def _ex_parse_trade(message):
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[2].isdigit():
+        bot.send_message(message.chat.id, "❓ Формат: <code>/buy BERL 5</code>")
+        return None
+    ticker = parts[1].upper()
+    shares = int(parts[2])
+    if shares <= 0 or shares > EXCHANGE_MAX_TRADE:
+        bot.send_message(message.chat.id, f"❌ Количество должно быть от 1 до {EXCHANGE_MAX_TRADE}.")
+        return None
+    return ticker, shares
+
+
+@bot.message_handler(commands=["buy"])
+def handle_exchange_buy(message: Message) -> None:
+    parsed = _ex_parse_trade(message)
+    if not parsed:
+        return
+    ticker, shares = parsed
+    user_id = message.from_user.id
+    _ex_ensure_trader(user_id)
+    conn = _ex_db()
+    ex = conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
+    if not ex:
+        conn.close()
+        bot.send_message(message.chat.id, "❌ Такой акции нет. Посмотри /exchanges")
+        return
+
+    price = float(ex["price"])
+    total = price * shares
+    trader = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
+    if float(trader["balance"]) < total:
+        conn.close()
+        bot.send_message(message.chat.id, f"❌ Недостаточно денег. Нужно <b>{total:,.2f} ₽</b>.")
+        return
+
+    holding = conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"])).fetchone()
+    old_shares = int(holding["shares"]) if holding else 0
+    old_avg = float(holding["avg_price"]) if holding else 0.0
+    new_shares = old_shares + shares
+    new_avg = ((old_shares * old_avg) + total) / new_shares
+
+    conn.execute("UPDATE ex_traders SET balance=balance-? WHERE user_id=?", (total, user_id))
+    conn.execute(
+        "INSERT INTO ex_holdings(user_id,exchange_id,shares,avg_price) VALUES(?,?,?,?) "
+        "ON CONFLICT(user_id,exchange_id) DO UPDATE SET shares=excluded.shares,avg_price=excluded.avg_price",
+        (user_id, ex["id"], new_shares, new_avg),
+    )
+    new_price, change = _ex_change_price(conn, ex["id"], min(0.012, shares / 10000.0))
+    conn.execute(
+        "INSERT INTO ex_transactions(user_id,exchange_id,action,shares,price,total,ts) VALUES(?,?,?,?,?,?,?)",
+        (user_id, ex["id"], "BUY", shares, price, total, datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    conn.close()
+
+    bot.send_message(message.chat.id, f"📈 <b>Покупка исполнена</b>\n\n🪙 {shares} × {ticker}\n💵 Цена сделки: {price:,.2f} ₽\n💸 Сумма: {total:,.2f} ₽\n📊 Новый курс: {new_price:,.2f} ₽ ({change:+.2f}%)")
+    try:
+        _ex_replace_market(message.chat.id, user_id, ex["id"])
+    except Exception as exc:
+        logger.exception("Exchange chart error: %s", exc)
+
+
+@bot.message_handler(commands=["sell"])
+def handle_exchange_sell(message: Message) -> None:
+    parsed = _ex_parse_trade(message)
+    if not parsed:
+        return
+    ticker, shares = parsed
+    user_id = message.from_user.id
+    _ex_ensure_trader(user_id)
+    conn = _ex_db()
+    ex = conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
+    if not ex:
+        conn.close()
+        bot.send_message(message.chat.id, "❌ Такой акции нет. Посмотри /exchanges")
+        return
+
+    holding = conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"])).fetchone()
+    if not holding or int(holding["shares"]) < shares:
+        conn.close()
+        bot.send_message(message.chat.id, "❌ У тебя недостаточно этих акций.")
+        return
+
+    price = float(ex["price"])
+    total = price * shares
+    remaining = int(holding["shares"]) - shares
+    conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?", (total, user_id))
+    if remaining:
+        conn.execute("UPDATE ex_holdings SET shares=? WHERE user_id=? AND exchange_id=?", (remaining, user_id, ex["id"]))
+    else:
+        conn.execute("DELETE FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"]))
+
+    new_price, change = _ex_change_price(conn, ex["id"], -min(0.012, shares / 10000.0))
+    conn.execute(
+        "INSERT INTO ex_transactions(user_id,exchange_id,action,shares,price,total,ts) VALUES(?,?,?,?,?,?,?)",
+        (user_id, ex["id"], "SELL", shares, price, total, datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    conn.close()
+
+    bot.send_message(message.chat.id, f"📉 <b>Продажа исполнена</b>\n\n🪙 {shares} × {ticker}\n💵 Цена сделки: {price:,.2f} ₽\n💰 Получено: {total:,.2f} ₽\n📊 Новый курс: {new_price:,.2f} ₽ ({change:+.2f}%)")
+    try:
+        _ex_replace_market(message.chat.id, user_id, ex["id"])
+    except Exception as exc:
+        logger.exception("Exchange chart error: %s", exc)
+
+
+@bot.message_handler(commands=["create_exchange"])
+def handle_create_exchange(message: Message) -> None:
+    parts = (message.text or "").split()
+    if len(parts) < 3:
+        bot.send_message(message.chat.id, "❓ Формат: <code>/create_exchange MyCompany MYC</code>")
+        return
+    ticker = parts[-1].upper()
+    name = " ".join(parts[1:-1]).strip()
+    if not name or not ticker.isalnum() or not 2 <= len(ticker) <= 8:
+        bot.send_message(message.chat.id, "❌ Название или тикер указаны неправильно. Тикер: 2–8 латинских символов/цифр.")
+        return
+
+    conn = _ex_db()
+    exists = conn.execute("SELECT id FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
+    if exists:
+        conn.close()
+        bot.send_message(message.chat.id, "❌ Такой тикер уже занят.")
+        return
+    cur = conn.execute(
+        "INSERT INTO ex_exchanges(owner_id,name,ticker,price,created_at) VALUES(?,?,?,?,?)",
+        (message.from_user.id, name, ticker, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
+    )
+    exchange_id = cur.lastrowid
+    conn.execute("INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)", (exchange_id, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+    bot.send_message(message.chat.id, f"🏭 <b>Биржа создана!</b>\n\n🏦 {html.escape(name)}\n📈 Тикер: <code>{ticker}</code>\n💰 Стартовая цена: <b>100 ₽</b>\n\nТеперь игроки могут покупать и продавать <code>{ticker}</code> через /buy и /sell.")
+
+
+@bot.message_handler(commands=["exchanges"])
+def handle_exchanges(message: Message) -> None:
+    conn = _ex_db()
+    rows = conn.execute("SELECT * FROM ex_exchanges ORDER BY id DESC LIMIT 30").fetchall()
+    conn.close()
+    lines = ["🏦 <b>Все биржи</b>\n"]
+    for r in rows:
+        lines.append(f"• <code>{r['ticker']}</code> — {html.escape(r['name'])}: <b>{r['price']:,.2f} ₽</b>\n  Владелец: <code>{r['owner_id']}</code>")
+    bot.send_message(message.chat.id, "\n".join(lines))
+
+
+@bot.message_handler(commands=["top"])
+def handle_exchange_top(message: Message) -> None:
+    conn = _ex_db()
+    traders = conn.execute("SELECT user_id,balance FROM ex_traders").fetchall()
+    result = []
+    for trader in traders:
+        holdings = conn.execute(
+            "SELECT h.shares,e.price FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id WHERE h.user_id=?",
+            (trader["user_id"],),
+        ).fetchall()
+        total = float(trader["balance"]) + sum(int(h["shares"]) * float(h["price"]) for h in holdings)
+        result.append((total, trader["user_id"]))
+    conn.close()
+    result.sort(reverse=True)
+    lines = ["🏆 <b>TOP TRADERS</b>\n"]
+    for i, (total, uid) in enumerate(result[:20], 1):
+        lines.append(f"{i}. <code>{uid}</code> — <b>{total:,.2f} ₽</b>")
+    bot.send_message(message.chat.id, "\n".join(lines) if len(lines) > 1 else "🏆 Пока рейтинг пуст.")
+
+
+# ВАЖНО: этот callback зарегистрирован ДО старого общего callback-хендлера.
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ex_"))
+def handle_exchange_callback(call: CallbackQuery) -> None:
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id if call.message else user_id
+    try:
+        if call.data == "ex_refresh":
+            bot.answer_callback_query(call.id, "🔄 Обновляю рынок...")
+            _ex_replace_market(chat_id, user_id, 1)
+        elif call.data == "ex_portfolio":
+            bot.answer_callback_query(call.id)
+            handle_exchange_portfolio(call.message)
+        elif call.data == "ex_bonus":
+            bot.answer_callback_query(call.id)
+            handle_exchange_bonus(call.message)
+    except Exception as exc:
+        logger.exception("Exchange callback error: %s", exc)
+        try:
+            bot.answer_callback_query(call.id, "❌ Ошибка биржи", show_alert=True)
+        except Exception:
+            pass
+
+# ── END BERLIONS EXCHANGE SYSTEM ───────────────────────────────────────────────
+
+
 # ── Dice game logic ───────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["dice"])
