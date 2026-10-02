@@ -243,7 +243,7 @@ def handle_start(message: Message) -> None:
             f"• /start — приветствие и главное меню\n"
             f"• /help — список доступных команд\n"
             f"• /search <i>запрос</i> — поиск игры или контента\n"
-            f"• /dice — сыграть в кости 🎲\n\n"
+            f"• /dice — сыграть в кости 🎲\n• /profile — профиль и активность\n• /top — топ активности\n• /topmoney — топ капитала биржи\n\n"
             f"🔍 <b>Поиск:</b>\n"
             f"Например: <code>/search standoff 2</code>\n\n"
             f"🎲 Нажми кнопку ниже, чтобы сразу сыграть."
@@ -953,7 +953,7 @@ def handle_exchanges(message: Message) -> None:
     bot.send_message(message.chat.id, "\n".join(lines))
 
 
-@bot.message_handler(commands=["top"])
+@bot.message_handler(commands=["topmoney", "toptraders"])
 def handle_exchange_top(message: Message) -> None:
     conn = _ex_db()
     traders = conn.execute("SELECT user_id,balance FROM ex_traders").fetchall()
@@ -1412,17 +1412,6 @@ def handle_demote(message: Message) -> None:
         bot.send_message(message.chat.id, "⚠️ Функция remove_admin не найдена в database.py.")
 
 
-@bot.message_handler(commands=["ban"])
-def handle_ban(message: Message) -> None:
-    if _get_user_rank(message.chat.id, message.from_user.id) < 3: bot.send_message(message.chat.id, "⛔ Требуется минимум 3 ранг."); return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ Ответь на сообщение или /ban ID"); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 3): bot.send_message(message.chat.id, "⛔ Недостаточно прав."); return
-    try:
-        bot.ban_chat_member(message.chat.id, target_id)
-        bot.send_message(message.chat.id, f"🚫 Пользователь {target_id} забанен.")
-    except Exception as e: bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-
 @bot.message_handler(commands=["kick"])
 def handle_kick(message: Message) -> None:
     if _get_user_rank(message.chat.id, message.from_user.id) < 2: bot.send_message(message.chat.id, "⛔ Требуется минимум 2 ранг."); return
@@ -1433,27 +1422,6 @@ def handle_kick(message: Message) -> None:
         bot.kick_chat_member(message.chat.id, target_id)
         bot.unban_chat_member(message.chat.id, target_id)
         bot.send_message(message.chat.id, f"👢 Пользователь {target_id} кикнут.")
-    except Exception as e: bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=["mute"])
-def handle_mute(message: Message) -> None:
-    if _get_user_rank(message.chat.id, message.from_user.id) < 2: bot.send_message(message.chat.id, "⛔ Требуется минимум 2 ранг."); return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ /mute (ответ)"); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 2): bot.send_message(message.chat.id, "⛔ Недостаточно прав."); return
-    try:
-        bot.restrict_chat_member(message.chat.id, target_id, can_send_messages=False)
-        bot.send_message(message.chat.id, f"🔇 Пользователь {target_id} замучен.")
-    except Exception as e: bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=["unmute"])
-def handle_unmute(message: Message) -> None:
-    if _get_user_rank(message.chat.id, message.from_user.id) < 2: bot.send_message(message.chat.id, "⛔ Требуется минимум 2 ранг."); return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ /unmute"); return
-    try:
-        bot.restrict_chat_member(message.chat.id, target_id, can_send_messages=True)
-        bot.send_message(message.chat.id, f"🔊 Пользователь {target_id} размучен.")
     except Exception as e: bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=["warn"])
@@ -1474,12 +1442,599 @@ def handle_warn(message: Message) -> None:
     else: bot.send_message(message.chat.id, "⚠️ Функции предупреждений не найдены в database.py.")
 
 
+# ── BERLIONS SOCIAL SYSTEM ────────────────────────────────────────────────────
+# Профили, активность, награды, браки, кланы и безопасные ролевые команды.
+
+import re
+from datetime import timedelta
+
+SOCIAL_DB = "social.db"
+SOCIAL_GRAPH_DIR = "social_graphs"
+
+
+def _social_db():
+    conn = sqlite3.connect(SOCIAL_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _social_init_db():
+    conn = _social_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS social_users (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_social_users_username
+        ON social_users(chat_id, username);
+
+    CREATE TABLE IF NOT EXISTS social_activity (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        day TEXT NOT NULL,
+        messages INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat_id, user_id, day)
+    );
+
+    CREATE TABLE IF NOT EXISTS social_awards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        from_user INTEGER NOT NULL,
+        to_user INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS social_marriage_proposals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        from_user INTEGER NOT NULL,
+        to_user INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+    );
+
+    CREATE TABLE IF NOT EXISTS social_marriages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        user1 INTEGER NOT NULL,
+        user2 INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_social_marriages_chat
+        ON social_marriages(chat_id, active);
+
+    CREATE TABLE IF NOT EXISTS social_clans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        name_key TEXT NOT NULL,
+        owner_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(chat_id, name_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS social_clan_members (
+        chat_id INTEGER NOT NULL,
+        clan_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        joined_at TEXT NOT NULL,
+        PRIMARY KEY(chat_id, user_id)
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+
+_social_init_db()
+
+
+def _social_now():
+    return datetime.now().replace(microsecond=0)
+
+
+def _social_user_label(chat_id: int, user_id: int) -> str:
+    conn = _social_db()
+    row = conn.execute(
+        "SELECT username,first_name,last_name FROM social_users WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id),
+    ).fetchone()
+    conn.close()
+    if row:
+        if row["username"]:
+            return "@" + html.escape(row["username"])
+        name = " ".join(x for x in (row["first_name"], row["last_name"]) if x).strip()
+        if name:
+            return html.escape(name)
+    return f"<code>{user_id}</code>"
+
+
+def _social_register(message: Message) -> None:
+    if not message.from_user or message.chat.type == "private":
+        return
+    now = _social_now().isoformat(sep=" ")
+    u = message.from_user
+    username = (u.username or "").lower() or None
+    first_name = u.first_name or ""
+    last_name = u.last_name or ""
+    conn = _social_db()
+    conn.execute("""
+        INSERT INTO social_users(chat_id,user_id,username,first_name,last_name,first_seen,last_seen)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(chat_id,user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_name=excluded.last_name,
+            last_seen=excluded.last_seen
+    """, (message.chat.id, u.id, username, first_name, last_name, now, now))
+    day = now[:10]
+    conn.execute("""
+        INSERT INTO social_activity(chat_id,user_id,day,messages)
+        VALUES(?,?,?,1)
+        ON CONFLICT(chat_id,user_id,day) DO UPDATE SET messages=messages+1
+    """, (message.chat.id, u.id, day))
+    conn.commit()
+    conn.close()
+
+
+def _social_target(message: Message, arg_text: str = "") -> int | None:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+    parts = (arg_text or "").split()
+    if not parts:
+        return None
+    token = parts[0].strip()
+    if token.isdigit():
+        return int(token)
+    if token.startswith("@"):
+        username = token[1:].lower()
+        conn = _social_db()
+        row = conn.execute(
+            "SELECT user_id FROM social_users WHERE chat_id=? AND username=? ORDER BY last_seen DESC LIMIT 1",
+            (message.chat.id, username),
+        ).fetchone()
+        conn.close()
+        return int(row["user_id"]) if row else None
+    return None
+
+
+def _social_name_from_message(message: Message) -> str:
+    u = message.from_user
+    if u.username:
+        return "@" + u.username
+    return u.first_name or str(u.id)
+
+
+def _social_period_start(period: str):
+    now = _social_now()
+    if period == "day":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "week":
+        base = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return base - timedelta(days=base.weekday())
+    if period == "month":
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return datetime.min
+
+
+def _social_activity_for_user(chat_id: int, user_id: int, period: str = "all") -> int:
+    conn = _social_db()
+    if period == "all":
+        row = conn.execute("SELECT COALESCE(SUM(messages),0) n FROM social_activity WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    else:
+        start = _social_period_start(period).date().isoformat()
+        row = conn.execute("SELECT COALESCE(SUM(messages),0) n FROM social_activity WHERE chat_id=? AND user_id=? AND day>=?", (chat_id, user_id, start)).fetchone()
+    conn.close()
+    return int(row["n"] or 0)
+
+
+def _social_top_rows(chat_id: int, period: str, limit: int = 10):
+    conn = _social_db()
+    if period == "all":
+        rows = conn.execute("""
+            SELECT u.user_id,u.username,u.first_name,u.last_name,COALESCE(SUM(a.messages),0) messages
+            FROM social_users u LEFT JOIN social_activity a
+              ON a.chat_id=u.chat_id AND a.user_id=u.user_id
+            WHERE u.chat_id=?
+            GROUP BY u.user_id
+            ORDER BY messages DESC, u.last_seen ASC
+            LIMIT ?
+        """, (chat_id, limit)).fetchall()
+    else:
+        start = _social_period_start(period).date().isoformat()
+        rows = conn.execute("""
+            SELECT u.user_id,u.username,u.first_name,u.last_name,COALESCE(SUM(a.messages),0) messages
+            FROM social_users u LEFT JOIN social_activity a
+              ON a.chat_id=u.chat_id AND a.user_id=u.user_id AND a.day>=?
+            WHERE u.chat_id=?
+            GROUP BY u.user_id
+            HAVING messages > 0
+            ORDER BY messages DESC, u.last_seen ASC
+            LIMIT ?
+        """, (start, chat_id, limit)).fetchall()
+    conn.close()
+    return rows
+
+
+# Мини-шрифт 5x7 для PNG. Только ASCII, чтобы не зависеть от системных шрифтов.
+_SOCIAL_FONT = {
+    "A":"01110 10001 10001 11111 10001 10001 10001", "B":"11110 10001 10001 11110 10001 10001 11110",
+    "C":"01111 10000 10000 10000 10000 10000 01111", "D":"11110 10001 10001 10001 10001 10001 11110",
+    "E":"11111 10000 10000 11110 10000 10000 11111", "F":"11111 10000 10000 11110 10000 10000 10000",
+    "G":"01111 10000 10000 10111 10001 10001 01111", "H":"10001 10001 10001 11111 10001 10001 10001",
+    "I":"11111 00100 00100 00100 00100 00100 11111", "J":"00111 00010 00010 00010 10010 10010 01100",
+    "K":"10001 10010 10100 11000 10100 10010 10001", "L":"10000 10000 10000 10000 10000 10000 11111",
+    "M":"10001 11011 10101 10101 10001 10001 10001", "N":"10001 11001 10101 10011 10001 10001 10001",
+    "O":"01110 10001 10001 10001 10001 10001 01110", "P":"11110 10001 10001 11110 10000 10000 10000",
+    "Q":"01110 10001 10001 10001 10101 10010 01101", "R":"11110 10001 10001 11110 10100 10010 10001",
+    "S":"01111 10000 10000 01110 00001 00001 11110", "T":"11111 00100 00100 00100 00100 00100 00100",
+    "U":"10001 10001 10001 10001 10001 10001 01110", "V":"10001 10001 10001 10001 10001 01010 00100",
+    "W":"10001 10001 10001 10101 10101 11011 10001", "X":"10001 10001 01010 00100 01010 10001 10001",
+    "Y":"10001 10001 01010 00100 00100 00100 00100", "Z":"11111 00001 00010 00100 01000 10000 11111",
+    "0":"01110 10001 10011 10101 11001 10001 01110", "1":"00100 01100 00100 00100 00100 00100 01110",
+    "2":"01110 10001 00001 00010 00100 01000 11111", "3":"11110 00001 00001 01110 00001 00001 11110",
+    "4":"00010 00110 01010 10010 11111 00010 00010", "5":"11111 10000 10000 11110 00001 00001 11110",
+    "6":"01110 10000 10000 11110 10001 10001 01110", "7":"11111 00001 00010 00100 01000 01000 01000",
+    "8":"01110 10001 10001 01110 10001 10001 01110", "9":"01110 10001 10001 01111 00001 00001 01110",
+    ":":"00000 00100 00100 00000 00100 00100 00000", "-":"00000 00000 00000 11111 00000 00000 00000",
+    "%":"11001 11010 00010 00100 01000 01011 10011", " ":"00000 00000 00000 00000 00000 00000 00000"
+}
+
+
+def _social_profile_png(path: str, name: str, day: int, week: int, month: int, total: int):
+    import os
+    os.makedirs(SOCIAL_GRAPH_DIR, exist_ok=True)
+    width, height = 1200, 720
+    bg = (8, 10, 15)
+    panel = (18, 22, 31)
+    grid = (44, 49, 61)
+    text = (232, 236, 242)
+    accent = (125, 211, 252)
+    pixels = bytearray(bg * (width * height))
+
+    def set_px(x, y, color):
+        if 0 <= x < width and 0 <= y < height:
+            i = (int(y) * width + int(x)) * 3
+            pixels[i:i+3] = bytes(color)
+
+    def rect(x1, y1, x2, y2, color):
+        x1, x2 = max(0, int(x1)), min(width-1, int(x2))
+        y1, y2 = max(0, int(y1)), min(height-1, int(y2))
+        if x1 > x2 or y1 > y2: return
+        row = bytes(color) * (x2-x1+1)
+        for yy in range(y1, y2+1):
+            i = (yy*width+x1)*3
+            pixels[i:i+len(row)] = row
+
+    def draw_text(x, y, s, scale=4, color=text):
+        x0 = x
+        for ch in str(s).upper():
+            glyph = _SOCIAL_FONT.get(ch, _SOCIAL_FONT[" "]).split()
+            for gy, row in enumerate(glyph):
+                for gx, bit in enumerate(row):
+                    if bit == "1":
+                        rect(x + gx*scale, y + gy*scale, x + (gx+1)*scale-1, y + (gy+1)*scale-1, color)
+            x += 6*scale
+            if x > width-80:
+                x = x0; y += 9*scale
+
+    def line(x1,y1,x2,y2,color,thickness=5):
+        steps=max(abs(int(x2-x1)),abs(int(y2-y1)),1)
+        for i in range(steps+1):
+            t=i/steps; x=x1+(x2-x1)*t; y=y1+(y2-y1)*t
+            rect(x-thickness//2,y-thickness//2,x+thickness//2,y+thickness//2,color)
+
+    rect(35,35,width-35,height-35,panel)
+    draw_text(70,70,"BERLIONS PROFILE",5,accent)
+    draw_text(70,125,"ACTIVITY",4,text)
+    bars=[("DAY",day),("WEEK",week),("MONTH",month)]
+    maxv=max(1,day,week,month)
+    base_y=230
+    for idx,(label,val) in enumerate(bars):
+        y=base_y+idx*145
+        draw_text(80,y,label,4,text)
+        rect(300,y+2,1080,y+38,grid)
+        bw=max(4,int(780*val/maxv))
+        rect(300,y+2,300+bw,y+38,accent)
+        draw_text(300,y+58,str(val),4,text)
+    draw_text(80,650,"TOTAL",4,text)
+    draw_text(360,650,str(total),4,accent)
+
+    raw = bytes(pixels)
+    def png_chunk(kind,data):
+        return struct.pack(">I",len(data))+kind+data+struct.pack(">I",binascii.crc32(kind+data)&0xffffffff)
+    scan=b"".join(b"\x00"+raw[y*width*3:(y+1)*width*3] for y in range(height))
+    png=b"\x89PNG\r\n\x1a\n"+png_chunk(b"IHDR",struct.pack(">IIBBBBB",width,height,8,2,0,0,0))+png_chunk(b"IDAT",zlib.compress(scan,6))+png_chunk(b"IEND",b"")
+    with open(path,"wb") as f: f.write(png)
+
+
+def _social_marriage_stage(days: int) -> str:
+    if days < 7: return "💚 Зелёные"
+    if days < 30: return "🌱 Молодые"
+    if days < 90: return "💍 Серьёзные"
+    if days < 180: return "💎 Опытные"
+    return "👑 Легендарные"
+
+
+def _social_duration_text(start: str) -> str:
+    try:
+        days = max(0, (_social_now() - datetime.fromisoformat(start)).days)
+    except Exception:
+        days = 0
+    if days < 1: return "меньше дня"
+    if days % 10 == 1 and days % 100 != 11: word="день"
+    elif days % 10 in (2,3,4) and days % 100 not in (12,13,14): word="дня"
+    else: word="дней"
+    return f"{days} {word}"
+
+
+def _social_active_marriage(conn, chat_id: int, user_id: int):
+    return conn.execute("""
+        SELECT * FROM social_marriages
+        WHERE chat_id=? AND active=1 AND (user1=? OR user2=?) LIMIT 1
+    """, (chat_id,user_id,user_id)).fetchone()
+
+
+@bot.message_handler(commands=["profile", "профиль"])
+def handle_social_profile(message: Message) -> None:
+    target = _social_target(message, " ".join((message.text or "").split()[1:])) or message.from_user.id
+    conn = _social_db()
+    row = conn.execute("SELECT first_name,username FROM social_users WHERE chat_id=? AND user_id=?", (message.chat.id,target)).fetchone()
+    conn.close()
+    day = _social_activity_for_user(message.chat.id,target,"day")
+    week = _social_activity_for_user(message.chat.id,target,"week")
+    month = _social_activity_for_user(message.chat.id,target,"month")
+    total = _social_activity_for_user(message.chat.id,target,"all")
+    name = row["username"] if row and row["username"] else (row["first_name"] if row else f"User {target}")
+    path=os.path.join(SOCIAL_GRAPH_DIR,f"profile_{message.chat.id}_{target}.png")
+    _social_profile_png(path,name,day,week,month,total)
+    caption=(f"👤 <b>Профиль {html.escape(str(name))}</b>\n\n"
+             f"💬 Сегодня: <b>{day}</b> сообщений\n"
+             f"📅 За неделю: <b>{week}</b>\n"
+             f"🗓 За месяц: <b>{month}</b>\n"
+             f"📊 Всего: <b>{total}</b>")
+    with open(path,"rb") as photo: bot.send_photo(message.chat.id,photo,caption=caption)
+
+
+@bot.message_handler(commands=["awards", "награды"])
+def handle_social_awards(message: Message) -> None:
+    conn=_social_db()
+    rows=conn.execute("SELECT reason,created_at,from_user FROM social_awards WHERE chat_id=? AND to_user=? ORDER BY id DESC LIMIT 20",(message.chat.id,message.from_user.id)).fetchall()
+    conn.close()
+    if not rows:
+        bot.send_message(message.chat.id,"🏅 У тебя пока нет наград.")
+        return
+    lines=["🏅 <b>Твои награды</b>\n"]
+    for r in rows:
+        lines.append(f"🏆 {html.escape(r['reason'])} — {r['created_at'][:10]}")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(commands=["marriages", "браки"])
+def handle_social_marriages(message: Message) -> None:
+    conn=_social_db()
+    rows=conn.execute("SELECT * FROM social_marriages WHERE chat_id=? AND active=1 ORDER BY created_at ASC",(message.chat.id,)).fetchall()
+    conn.close()
+    if not rows:
+        bot.send_message(message.chat.id,"💍 В этом чате пока нет активных браков.")
+        return
+    counts={}
+    for r in rows:
+        d=max(0,(_social_now()-datetime.fromisoformat(r['created_at'])).days)
+        counts[_social_marriage_stage(d)]=counts.get(_social_marriage_stage(d),0)+1
+    lines=[f"💍 <b>Браки чата</b>\nВсего активных: <b>{len(rows)}</b>\n"]
+    for stage,n in counts.items(): lines.append(f"{stage}: <b>{n}</b>")
+    lines.append("\n<b>Самые долгие:</b>")
+    for r in sorted(rows,key=lambda x:x['created_at'])[:10]:
+        d=max(0,(_social_now()-datetime.fromisoformat(r['created_at'])).days)
+        lines.append(f"• {_social_user_label(message.chat.id,r['user1'])} ❤️ {_social_user_label(message.chat.id,r['user2'])} — <b>{_social_duration_text(r['created_at'])}</b>")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(commands=["clans", "кланы"])
+def handle_social_clans(message: Message) -> None:
+    conn=_social_db()
+    rows=conn.execute("""
+        SELECT c.name,c.owner_id,COUNT(m.user_id) members
+        FROM social_clans c LEFT JOIN social_clan_members m ON m.clan_id=c.id
+        WHERE c.chat_id=? GROUP BY c.id ORDER BY members DESC,c.name LIMIT 20
+    """,(message.chat.id,)).fetchall()
+    conn.close()
+    if not rows:
+        bot.send_message(message.chat.id,"🏰 Кланов пока нет. Создай первый: <code>создать клан название</code>")
+        return
+    lines=["🏰 <b>Кланы Berlions</b>\n"]
+    for i,r in enumerate(rows,1): lines.append(f"{i}. <b>{html.escape(r['name'])}</b> — 👥 {r['members']}")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(commands=["top"])
+def handle_social_top_command(message: Message) -> None:
+    handle_social_top(message,"all")
+    # Старый рейтинг биржи не теряем: он доступен отдельно через /topmoney.
+
+
+def handle_social_top(message: Message, period: str = "all") -> None:
+    rows=_social_top_rows(message.chat.id,period,10)
+    title={"all":"🏆 ТОП АКТИВНОСТИ","day":"🔥 ТОП ДНЯ","week":"📅 ТОП НЕДЕЛИ","month":"🗓 ТОП МЕСЯЦА"}[period]
+    if not rows:
+        bot.send_message(message.chat.id,"📊 Пока нет статистики активности.")
+        return
+    lines=[f"<b>{title}</b>\n"]
+    medals=["🥇","🥈","🥉"]
+    for i,r in enumerate(rows,1):
+        label=("@"+r['username']) if r['username'] else (r['first_name'] or f"User {r['user_id']}")
+        prefix=medals[i-1] if i<=3 else f"{i}."
+        lines.append(f"{prefix} <b>{html.escape(str(label))}</b> — <b>{r['messages']}</b> сообщ.")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(commands=["topday", "topweek", "topmonth"])
+def handle_social_top_period_command(message: Message) -> None:
+    cmd=(message.text or "").split()[0].lower().lstrip("/")
+    handle_social_top(message,{"topday":"day","topweek":"week","topmonth":"month"}[cmd])
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^топ(?:\s+(дня|неделя|месяц))?$",m.text.strip(),re.I)), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"профиль", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_profile_plain(message: Message) -> None:
+    handle_social_profile(message)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"награды", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_awards_plain(message: Message) -> None:
+    handle_social_awards(message)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"браки", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_marriages_plain(message: Message) -> None:
+    handle_social_marriages(message)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"кланы", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_clans_plain(message: Message) -> None:
+    handle_social_clans(message)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^брак(?:\s+.+)?$", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_marry_plain(message: Message) -> None:
+    handle_social_marry_command(message)
+
+
+def handle_social_top_plain(message: Message) -> None:
+    value=message.text.strip().lower()
+    handle_social_top(message,{"топ":"all","топ дня":"day","топ неделя":"week","топ месяц":"month"}[value])
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^наградить(?:\s+.+)?$",m.text.strip(),re.I)), content_types=["text"])
+def handle_social_award(message: Message) -> None:
+    parts=message.text.strip().split(maxsplit=2)
+    arg=parts[1] if len(parts)>1 else ""
+    reason=parts[2].strip() if len(parts)>2 else "За вклад в чат"
+    target=_social_target(message,arg)
+    if not target:
+        bot.send_message(message.chat.id,"🏅 Формат: <code>наградить @user причина</code> или ответом на сообщение: <code>наградить причина</code>")
+        return
+    if target==message.from_user.id:
+        bot.send_message(message.chat.id,"😄 Себя наградить нельзя."); return
+    now=_social_now().isoformat(sep=" ")
+    conn=_social_db(); conn.execute("INSERT INTO social_awards(chat_id,from_user,to_user,reason,created_at) VALUES(?,?,?,?,?)",(message.chat.id,message.from_user.id,target,reason,now)); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"🏆 {_social_user_label(message.chat.id,target)} <b>награждён!</b>\n🎖 Причина: <i>{html.escape(reason)}</i>")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^создать\s+клан\s+.+$",m.text.strip(),re.I)), content_types=["text"])
+def handle_social_create_clan(message: Message) -> None:
+    name=message.text.strip().split(None,2)[2].strip()
+    if len(name)<2 or len(name)>32:
+        bot.send_message(message.chat.id,"🏰 Название клана должно быть от 2 до 32 символов."); return
+    key=name.casefold()
+    conn=_social_db()
+    try:
+        existing=conn.execute("SELECT id FROM social_clans WHERE chat_id=? AND name_key=?",(message.chat.id,key)).fetchone()
+        if existing:
+            bot.send_message(message.chat.id,"❌ Такой клан уже существует."); conn.close(); return
+        cur=conn.execute("INSERT INTO social_clans(chat_id,name,name_key,owner_id,created_at) VALUES(?,?,?,?,?)",(message.chat.id,name,key,message.from_user.id,_social_now().isoformat(sep=" ")))
+        clan_id=cur.lastrowid
+        conn.execute("INSERT OR REPLACE INTO social_clan_members(chat_id,clan_id,user_id,joined_at) VALUES(?,?,?,?)",(message.chat.id,clan_id,message.from_user.id,_social_now().isoformat(sep=" ")))
+        conn.commit()
+    finally: conn.close()
+    bot.send_message(message.chat.id,f"🏰 Клан <b>{html.escape(name)}</b> создан!\nТы автоматически вступил в него.\nВступить другим: <code>+клан {html.escape(name)}</code>")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^\+клан\s+.+$",m.text.strip(),re.I)), content_types=["text"])
+def handle_social_join_clan(message: Message) -> None:
+    name=message.text.strip().split(None,1)[1].strip(); key=name.casefold()
+    conn=_social_db(); clan=conn.execute("SELECT id,name FROM social_clans WHERE chat_id=? AND name_key=?",(message.chat.id,key)).fetchone()
+    if not clan:
+        conn.close(); bot.send_message(message.chat.id,"❌ Такой клан не найден. Посмотри список: <code>кланы</code>"); return
+    old=conn.execute("SELECT clan_id FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,message.from_user.id)).fetchone()
+    if old and old['clan_id']==clan['id']:
+        conn.close(); bot.send_message(message.chat.id,"🏰 Ты уже в этом клане!"); return
+    conn.execute("DELETE FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,message.from_user.id))
+    conn.execute("INSERT INTO social_clan_members(chat_id,clan_id,user_id,joined_at) VALUES(?,?,?,?)",(message.chat.id,clan['id'],message.from_user.id,_social_now().isoformat(sep=" ")))
+    conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"🏰 Добро пожаловать в клан <b>{html.escape(clan['name'])}</b>!")
+
+
+@bot.message_handler(commands=["marry", "брак"])
+def handle_social_marry_command(message: Message) -> None:
+    arg=" ".join((message.text or "").split()[1:])
+    target=_social_target(message,arg)
+    if not target:
+        bot.send_message(message.chat.id,"💍 Формат: <code>брак @user</code> или ответом на сообщение пользователя.")
+        return
+    if target==message.from_user.id:
+        bot.send_message(message.chat.id,"💍 Сам с собой брак не заключается 😄"); return
+    conn=_social_db()
+    if _social_active_marriage(conn,message.chat.id,message.from_user.id) or _social_active_marriage(conn,message.chat.id,target):
+        conn.close(); bot.send_message(message.chat.id,"💍 У одного из пользователей уже есть активный брак."); return
+    pending=conn.execute("SELECT id FROM social_marriage_proposals WHERE chat_id=? AND from_user=? AND to_user=? AND status='pending'",(message.chat.id,message.from_user.id,target)).fetchone()
+    if pending:
+        conn.close(); bot.send_message(message.chat.id,"⏳ Предложение уже отправлено."); return
+    cur=conn.execute("INSERT INTO social_marriage_proposals(chat_id,from_user,to_user,created_at,status) VALUES(?,?,?,?, 'pending')",(message.chat.id,message.from_user.id,target,_social_now().isoformat(sep=" ")))
+    proposal_id=cur.lastrowid; conn.commit(); conn.close()
+    markup=InlineKeyboardMarkup(row_width=2).add(InlineKeyboardButton("💍 Согласиться",callback_data=f"marry_yes:{proposal_id}"),InlineKeyboardButton("❌ Отказаться",callback_data=f"marry_no:{proposal_id}"))
+    bot.send_message(message.chat.id,f"💍 {_social_user_label(message.chat.id,message.from_user.id)} предлагает брак {_social_user_label(message.chat.id,target)}!\n\nСогласие второго пользователя обязательно.",reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("marry_"))
+def handle_social_marriage_callback(call: CallbackQuery) -> None:
+    try:
+        action,pid=call.data.split(":",1); pid=int(pid)
+        conn=_social_db(); p=conn.execute("SELECT * FROM social_marriage_proposals WHERE id=?",(pid,)).fetchone()
+        if not p or p['status']!='pending':
+            conn.close(); bot.answer_callback_query(call.id,"Предложение уже обработано.",show_alert=True); return
+        if call.from_user.id != p['to_user']:
+            conn.close(); bot.answer_callback_query(call.id,"Это предложение не для тебя.",show_alert=True); return
+        if action=="marry_no":
+            conn.execute("UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",(pid,)); conn.commit(); conn.close(); bot.answer_callback_query(call.id,"Отказ принят."); bot.edit_message_text("❌ Предложение отклонено.",call.message.chat.id,call.message.message_id); return
+        if _social_active_marriage(conn,p['chat_id'],p['from_user']) or _social_active_marriage(conn,p['chat_id'],p['to_user']):
+            conn.execute("UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",(pid,)); conn.commit(); conn.close(); bot.answer_callback_query(call.id,"У одного из вас уже есть брак.",show_alert=True); return
+        now=_social_now().isoformat(sep=" ")
+        conn.execute("UPDATE social_marriage_proposals SET status='accepted' WHERE id=?",(pid,))
+        conn.execute("INSERT INTO social_marriages(chat_id,user1,user2,created_at,active) VALUES(?,?,?,?,1)",(p['chat_id'],p['from_user'],p['to_user'],now))
+        conn.commit(); conn.close(); bot.answer_callback_query(call.id,"💍 Брак создан!"); bot.edit_message_text(f"💍 <b>Брак заключён!</b>\n\n{_social_user_label(p['chat_id'],p['from_user'])} ❤️ {_social_user_label(p['chat_id'],p['to_user'])}\n🌱 Стаж: <b>0 дней</b> — 💚 Зелёные",call.message.chat.id,call.message.message_id)
+    except Exception:
+        logger.exception("Marriage callback error")
+        try: bot.answer_callback_query(call.id,"❌ Ошибка",show_alert=True)
+        except Exception: pass
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^(поцеловал|обнял|обняла|поцеловала)\b",m.text.strip(),re.I)), content_types=["text"])
+def handle_social_roleplay(message: Message) -> None:
+    parts=message.text.strip().split(maxsplit=1); action=parts[0].lower(); target=_social_target(message,parts[1] if len(parts)>1 else "")
+    if not target:
+        bot.send_message(message.chat.id,f"💫 Формат: <code>{html.escape(action)} @user</code> или ответом на сообщение."); return
+    actor=_social_name_from_message(message); target_label=_social_user_label(message.chat.id,target)
+    verb={"поцеловал":"💋 поцеловал","поцеловала":"💋 поцеловала","обнял":"🤗 обнял","обняла":"🤗 обняла"}[action]
+    bot.send_message(message.chat.id,f"{verb} {target_label} 💫")
+
+
 @bot.message_handler(commands=["learn"])
 def handle_learn(message: Message) -> None:
     if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 5:
         bot.send_message(message.chat.id, "⛔ Только глава или глобальный.")
         return
     bot.send_message(message.chat.id, "✅ /learn активирован. Полная история чата пока не поддерживается (ограничения Telegram).")
+
+# Последний обработчик сообщений: собирает активность, не перехватывая уже обработанные команды.
+@bot.message_handler(content_types=["text"])
+def handle_social_activity_tracker(message: Message) -> None:
+    try:
+        _social_register(message)
+    except Exception:
+        logger.exception("Social activity tracker error")
+
+
 
 # ── Advertising/autopost ───────────────────────────────────────────────────────
 # Автопостинг рекламы удалён по запросу. Остальная логика бота не зависит от него.
