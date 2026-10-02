@@ -1070,6 +1070,12 @@ def _play_dice(chat_id: int, user_id: int) -> None:
 def handle_callback(call: CallbackQuery) -> None:
     user_id = call.from_user.id
     chat_id = call.message.chat.id
+
+    # Социальные кнопки должны обрабатываться раньше общего callback-хендлера.
+    # Этот хендлер зарегистрирован раньше функции брака, поэтому делегируем сюда.
+    if call.data and call.data.startswith("marry_"):
+        handle_social_marriage_callback(call)
+        return
     logger.info("Клик от пользователя: %s (@%s), ID: %s", call.from_user.first_name, call.from_user.username, user_id)
 
     if call.data.startswith("verify:"):
@@ -1587,12 +1593,14 @@ def _social_register(message: Message) -> None:
 
 
 def _social_target(message: Message, arg_text: str = "") -> int | None:
+    # Ответ на сообщение всегда имеет приоритет: это самый надёжный способ
+    # определить пользователя в Telegram.
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
     parts = (arg_text or "").split()
     if not parts:
         return None
-    token = parts[0].strip()
+    token = parts[0].strip().rstrip(",.!?")
     if token.isdigit():
         return int(token)
     if token.startswith("@"):
@@ -1693,68 +1701,59 @@ _SOCIAL_FONT = {
 def _social_profile_png(path: str, name: str, day: int, week: int, month: int, total: int):
     import os
     os.makedirs(SOCIAL_GRAPH_DIR, exist_ok=True)
-    width, height = 1200, 720
-    bg = (8, 10, 15)
-    panel = (18, 22, 31)
-    grid = (44, 49, 61)
-    text = (232, 236, 242)
-    accent = (125, 211, 252)
-    pixels = bytearray(bg * (width * height))
-
-    def set_px(x, y, color):
-        if 0 <= x < width and 0 <= y < height:
-            i = (int(y) * width + int(x)) * 3
-            pixels[i:i+3] = bytes(color)
-
-    def rect(x1, y1, x2, y2, color):
-        x1, x2 = max(0, int(x1)), min(width-1, int(x2))
-        y1, y2 = max(0, int(y1)), min(height-1, int(y2))
-        if x1 > x2 or y1 > y2: return
-        row = bytes(color) * (x2-x1+1)
-        for yy in range(y1, y2+1):
-            i = (yy*width+x1)*3
-            pixels[i:i+len(row)] = row
-
-    def draw_text(x, y, s, scale=4, color=text):
-        x0 = x
-        for ch in str(s).upper():
-            glyph = _SOCIAL_FONT.get(ch, _SOCIAL_FONT[" "]).split()
-            for gy, row in enumerate(glyph):
-                for gx, bit in enumerate(row):
-                    if bit == "1":
-                        rect(x + gx*scale, y + gy*scale, x + (gx+1)*scale-1, y + (gy+1)*scale-1, color)
-            x += 6*scale
-            if x > width-80:
-                x = x0; y += 9*scale
-
-    def line(x1,y1,x2,y2,color,thickness=5):
+    width, height = 1200, 760
+    bg=(7,8,12); card=(18,18,25); card2=(24,24,33); grid=(47,48,60)
+    white=(242,242,247); muted=(160,163,175); accent=(184,130,255); accent2=(113,76,170)
+    pixels=bytearray(bg*(width*height))
+    def rect(x1,y1,x2,y2,color):
+        x1,x2=max(0,int(x1)),min(width-1,int(x2)); y1,y2=max(0,int(y1)),min(height-1,int(y2))
+        if x1>x2 or y1>y2:return
+        row=bytes(color)*(x2-x1+1)
+        for yy in range(y1,y2+1):
+            i=(yy*width+x1)*3; pixels[i:i+len(row)]=row
+    def draw_text(x,y,s,scale=4,color=white):
+        x0=x
+        for ch in str(s).upper()[:28]:
+            glyph=_SOCIAL_FONT.get(ch,_SOCIAL_FONT[" "]).split()
+            for gy,row in enumerate(glyph):
+                for gx,bit in enumerate(row):
+                    if bit=="1": rect(x+gx*scale,y+gy*scale,x+(gx+1)*scale-1,y+(gy+1)*scale-1,color)
+            x+=6*scale
+            if x>width-100: x=x0; y+=9*scale
+    def line(x1,y1,x2,y2,color,thickness=4):
         steps=max(abs(int(x2-x1)),abs(int(y2-y1)),1)
         for i in range(steps+1):
             t=i/steps; x=x1+(x2-x1)*t; y=y1+(y2-y1)*t
             rect(x-thickness//2,y-thickness//2,x+thickness//2,y+thickness//2,color)
-
-    rect(35,35,width-35,height-35,panel)
-    draw_text(70,70,"BERLIONS PROFILE",5,accent)
-    draw_text(70,125,"ACTIVITY",4,text)
-    bars=[("DAY",day),("WEEK",week),("MONTH",month)]
-    maxv=max(1,day,week,month)
-    base_y=230
-    for idx,(label,val) in enumerate(bars):
-        y=base_y+idx*145
-        draw_text(80,y,label,4,text)
-        rect(300,y+2,1080,y+38,grid)
-        bw=max(4,int(780*val/maxv))
-        rect(300,y+2,300+bw,y+38,accent)
-        draw_text(300,y+58,str(val),4,text)
-    draw_text(80,650,"TOTAL",4,text)
-    draw_text(360,650,str(total),4,accent)
-
-    raw = bytes(pixels)
-    def png_chunk(kind,data):
-        return struct.pack(">I",len(data))+kind+data+struct.pack(">I",binascii.crc32(kind+data)&0xffffffff)
+    # dark Iris-like card
+    rect(28,28,width-28,height-28,card)
+    rect(55,55,width-55,170,card2)
+    # avatar placeholder / initials
+    rect(78,78,170,150,accent2)
+    initials=''.join([p[0] for p in str(name).replace('@',' ').split() if p])[:2] or 'U'
+    draw_text(91,92,initials,4,white)
+    draw_text(205,78,str(name),5,white)
+    draw_text(205,125,"BERLIONS PROFILE",3,muted)
+    # stats cards
+    stats=[("СЕГОДНЯ",day),("НЕДЕЛЯ",week),("МЕСЯЦ",month),("ВСЕГО",total)]
+    for i,(label,val) in enumerate(stats):
+        x=70+(i%2)*535; y=205+(i//2)*125
+        rect(x,y,x+495,y+100,card2)
+        draw_text(x+24,y+20,label,3,muted)
+        draw_text(x+24,y+54,str(val),5,accent if i<3 else white)
+    # activity chart
+    rect(70,470,width-70,700,card2)
+    draw_text(95,492,"АКТИВНОСТЬ",4,white)
+    vals=[day,week,month]; labels=["DAY","WEEK","MONTH"]; maxv=max(1,*vals)
+    for i,(lab,val) in enumerate(zip(labels,vals)):
+        y=550+i*43; draw_text(95,y,lab,3,muted); rect(220,y+1,1080,y+25,grid)
+        bw=max(5,int(860*val/maxv)); rect(220,y+1,220+bw,y+25,accent)
+        draw_text(1100,y,str(val),3,white)
+    raw=bytes(pixels)
+    def png_chunk(kind,data): return struct.pack(">I",len(data))+kind+data+struct.pack(">I",binascii.crc32(kind+data)&0xffffffff)
     scan=b"".join(b"\x00"+raw[y*width*3:(y+1)*width*3] for y in range(height))
     png=b"\x89PNG\r\n\x1a\n"+png_chunk(b"IHDR",struct.pack(">IIBBBBB",width,height,8,2,0,0,0))+png_chunk(b"IDAT",zlib.compress(scan,6))+png_chunk(b"IEND",b"")
-    with open(path,"wb") as f: f.write(png)
+    with open(path,"wb") as f:f.write(png)
 
 
 def _social_marriage_stage(days: int) -> str:
@@ -1786,7 +1785,8 @@ def _social_active_marriage(conn, chat_id: int, user_id: int):
 
 @bot.message_handler(commands=["profile", "профиль"])
 def handle_social_profile(message: Message) -> None:
-    target = _social_target(message, " ".join((message.text or "").split()[1:])) or message.from_user.id
+    args = " ".join((message.text or "").split()[1:])
+    target = _social_target(message, args) or message.from_user.id
     conn = _social_db()
     row = conn.execute("SELECT first_name,username FROM social_users WHERE chat_id=? AND user_id=?", (message.chat.id,target)).fetchone()
     conn.close()
@@ -1795,9 +1795,10 @@ def handle_social_profile(message: Message) -> None:
     month = _social_activity_for_user(message.chat.id,target,"month")
     total = _social_activity_for_user(message.chat.id,target,"all")
     name = row["username"] if row and row["username"] else (row["first_name"] if row else f"User {target}")
+    display_name = ("@" + name) if row and row["username"] else name
     path=os.path.join(SOCIAL_GRAPH_DIR,f"profile_{message.chat.id}_{target}.png")
-    _social_profile_png(path,name,day,week,month,total)
-    caption=(f"👤 <b>Профиль {html.escape(str(name))}</b>\n\n"
+    _social_profile_png(path,display_name,day,week,month,total)
+    caption=(f"👤 <b>Профиль {html.escape(str(display_name))}</b>\n\n"
              f"💬 Сегодня: <b>{day}</b> сообщений\n"
              f"📅 За неделю: <b>{week}</b>\n"
              f"🗓 За месяц: <b>{month}</b>\n"
@@ -1807,15 +1808,18 @@ def handle_social_profile(message: Message) -> None:
 
 @bot.message_handler(commands=["awards", "награды"])
 def handle_social_awards(message: Message) -> None:
+    args = " ".join((message.text or "").split()[1:])
+    target = _social_target(message, args) or message.from_user.id
     conn=_social_db()
-    rows=conn.execute("SELECT reason,created_at,from_user FROM social_awards WHERE chat_id=? AND to_user=? ORDER BY id DESC LIMIT 20",(message.chat.id,message.from_user.id)).fetchall()
+    rows=conn.execute("SELECT reason,created_at,from_user FROM social_awards WHERE chat_id=? AND to_user=? ORDER BY id DESC LIMIT 20",(message.chat.id,target)).fetchall()
     conn.close()
+    label = _social_user_label(message.chat.id,target)
     if not rows:
-        bot.send_message(message.chat.id,"🏅 У тебя пока нет наград.")
+        bot.send_message(message.chat.id,f"🏅 <b>Награды {label}</b>\n\nПока наград нет.")
         return
-    lines=["🏅 <b>Твои награды</b>\n"]
-    for r in rows:
-        lines.append(f"🏆 {html.escape(r['reason'])} — {r['created_at'][:10]}")
+    lines=[f"🏅 <b>Награды {label}</b>\n"]
+    for i,r in enumerate(rows,1):
+        lines.append(f"🏆 <b>#{i}</b>  {html.escape(r['reason'])}\n   📅 {r['created_at'][:10]}")
     bot.send_message(message.chat.id,"\n".join(lines))
 
 
@@ -1884,13 +1888,52 @@ def handle_social_top_period_command(message: Message) -> None:
     handle_social_top(message,{"topday":"day","topweek":"week","topmonth":"month"}[cmd])
 
 
-@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^топ(?:\s+(дня|неделя|месяц))?$",m.text.strip(),re.I)), content_types=["text"])
-@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"профиль", m.text.strip(), re.I)), content_types=["text"])
+@bot.message_handler(commands=["commands", "команды"])
+def handle_social_commands(message: Message) -> None:
+    text = (
+        "📚 <b>Команды Berlions</b>\n\n"
+        "👤 <b>Профиль и общение</b>\n"
+        "• <code>профиль</code> — твой профиль\n"
+        "• <code>профиль @user</code> — профиль пользователя\n"
+        "• <code>награды</code> — твои награды\n"
+        "• <code>награды @user</code> — награды пользователя\n"
+        "• <code>наградить @user причина</code> — выдать награду\n"
+        "• <code>поцеловать @user</code> / ответом — поцеловать\n"
+        "• <code>обнять @user</code> / ответом — обнять\n"
+        "• <code>дай пять @user</code> / ответом — дать пять\n\n"
+        "💍 <b>Отношения</b>\n"
+        "• <code>брак @user</code> / ответом — предложение брака\n"
+        "• <code>браки</code> — статистика браков\n\n"
+        "🏰 <b>Кланы</b>\n"
+        "• <code>создать клан Название</code>\n"
+        "• <code>+клан Название</code>\n"
+        "• <code>кланы</code> — список кланов\n\n"
+        "🏆 <b>Активность</b>\n"
+        "• <code>топ</code> — общий топ\n"
+        "• <code>топ дня</code>\n"
+        "• <code>топ неделя</code>\n"
+        "• <code>топ месяц</code>\n\n"
+        "💰 <b>Биржа</b>\n"
+        "• <code>/market</code> • <code>/balance</code> • <code>/bonus</code>\n"
+        "• <code>/portfolio</code> • <code>/buy</code> • <code>/sell</code>\n"
+        "• <code>/exchange</code> • <code>/exchanges</code>\n\n"
+        "🎲 <code>/dice</code> — кости\n"
+        "🔎 <code>/search запрос</code> — поиск"
+    )
+    bot.send_message(message.chat.id,text)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"команды", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_commands_plain(message: Message) -> None:
+    handle_social_commands(message)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"профиль(?:\s+@\w+)?", m.text.strip(), re.I)), content_types=["text"])
 def handle_social_profile_plain(message: Message) -> None:
     handle_social_profile(message)
 
 
-@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"награды", m.text.strip(), re.I)), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"награды(?:\s+@\w+)?", m.text.strip(), re.I)), content_types=["text"])
 def handle_social_awards_plain(message: Message) -> None:
     handle_social_awards(message)
 
@@ -1905,22 +1948,41 @@ def handle_social_clans_plain(message: Message) -> None:
     handle_social_clans(message)
 
 
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"топ", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_top_plain(message: Message) -> None:
+    handle_social_top(message,"all")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"топ\s+дня", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_top_day_plain(message: Message) -> None:
+    handle_social_top(message,"day")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"топ\s+неделя", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_top_week_plain(message: Message) -> None:
+    handle_social_top(message,"week")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"топ\s+месяц", m.text.strip(), re.I)), content_types=["text"])
+def handle_social_top_month_plain(message: Message) -> None:
+    handle_social_top(message,"month")
+
+
 @bot.message_handler(func=lambda m: bool(m.text and re.match(r"^брак(?:\s+.+)?$", m.text.strip(), re.I)), content_types=["text"])
 def handle_social_marry_plain(message: Message) -> None:
     handle_social_marry_command(message)
 
 
-def handle_social_top_plain(message: Message) -> None:
-    value=message.text.strip().lower()
-    handle_social_top(message,{"топ":"all","топ дня":"day","топ неделя":"week","топ месяц":"month"}[value])
-
-
 @bot.message_handler(func=lambda m: bool(m.text and re.match(r"^наградить(?:\s+.+)?$",m.text.strip(),re.I)), content_types=["text"])
 def handle_social_award(message: Message) -> None:
     parts=message.text.strip().split(maxsplit=2)
-    arg=parts[1] if len(parts)>1 else ""
-    reason=parts[2].strip() if len(parts)>2 else "За вклад в чат"
-    target=_social_target(message,arg)
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target=_social_target(message,"")
+        reason=parts[1].strip() if len(parts)>1 else "За вклад в чат"
+    else:
+        arg=parts[1] if len(parts)>1 else ""
+        reason=parts[2].strip() if len(parts)>2 else "За вклад в чат"
+        target=_social_target(message,arg)
     if not target:
         bot.send_message(message.chat.id,"🏅 Формат: <code>наградить @user причина</code> или ответом на сообщение: <code>наградить причина</code>")
         return
@@ -1986,7 +2048,6 @@ def handle_social_marry_command(message: Message) -> None:
     bot.send_message(message.chat.id,f"💍 {_social_user_label(message.chat.id,message.from_user.id)} предлагает брак {_social_user_label(message.chat.id,target)}!\n\nСогласие второго пользователя обязательно.",reply_markup=markup)
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("marry_"))
 def handle_social_marriage_callback(call: CallbackQuery) -> None:
     try:
         action,pid=call.data.split(":",1); pid=int(pid)
@@ -2009,14 +2070,27 @@ def handle_social_marriage_callback(call: CallbackQuery) -> None:
         except Exception: pass
 
 
-@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^(поцеловал|обнял|обняла|поцеловала)\b",m.text.strip(),re.I)), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^(поцеловать|поцеловал|поцеловала|обнять|обнял|обняла|дай пять|дать пять|погладить|пожать руку)\b",m.text.strip(),re.I)), content_types=["text"])
 def handle_social_roleplay(message: Message) -> None:
-    parts=message.text.strip().split(maxsplit=1); action=parts[0].lower(); target=_social_target(message,parts[1] if len(parts)>1 else "")
+    parts=message.text.strip().split(maxsplit=1)
+    action=parts[0].lower()
+    target=_social_target(message,parts[1] if len(parts)>1 else "")
     if not target:
-        bot.send_message(message.chat.id,f"💫 Формат: <code>{html.escape(action)} @user</code> или ответом на сообщение."); return
-    actor=_social_name_from_message(message); target_label=_social_user_label(message.chat.id,target)
-    verb={"поцеловал":"💋 поцеловал","поцеловала":"💋 поцеловала","обнял":"🤗 обнял","обняла":"🤗 обняла"}[action]
-    bot.send_message(message.chat.id,f"{verb} {target_label} 💫")
+        bot.send_message(message.chat.id,f"💫 Формат: <code>{html.escape(action)} @user</code> или просто ответь этой командой на сообщение."); return
+    target_label=_social_user_label(message.chat.id,target)
+    replies={
+        "поцеловать": f"💋 {target_label}, тебя только что поцеловали!",
+        "поцеловал": f"💋 {target_label}, тебя поцеловали!",
+        "поцеловала": f"💋 {target_label}, тебя поцеловали!",
+        "обнять": f"🤗 {target_label}, тебя крепко обняли!",
+        "обнял": f"🤗 {target_label}, тебя крепко обняли!",
+        "обняла": f"🤗 {target_label}, тебя крепко обняли!",
+        "дай пять": f"🖐 {target_label}, вам дали пять!",
+        "дать пять": f"🖐 {target_label}, вам дали пять!",
+        "погладить": f"🥰 {target_label}, тебя нежно погладили!",
+        "пожать руку": f"🤝 {target_label}, вам пожали руку!",
+    }
+    bot.send_message(message.chat.id,replies.get(action,f"✨ {target_label} — действие выполнено!"))
 
 
 @bot.message_handler(commands=["learn"])
