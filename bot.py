@@ -644,7 +644,7 @@ def _ex_chart(exchange_id: int):
 
     return path
 
-def _ex_market_text(exchange_id: int):
+def _ex_market_text(exchange_id: int, chat_id: int | None = None):
     conn = _ex_db()
     ex = conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
     owner = conn.execute("SELECT user_id FROM ex_traders WHERE user_id=?", (ex["owner_id"],)).fetchone()
@@ -663,7 +663,7 @@ def _ex_market_text(exchange_id: int):
         f"🏦 <b>{_ex_escape(ex['name'])}</b>  <code>${_ex_escape(ex['ticker'])}</code>\n"
         f"💰 Цена: <b>{current:,.2f} ₽</b>\n"
         f"{arrow} Изменение: <b>{change:+.2f}%</b>\n"
-        f"👤 Владелец: <code>{ex['owner_id']}</code>\n\n"
+        f"👤 Владелец: {_mention_user(chat_id, int(ex['owner_id']))}\n\n"
         f"/buy {ex['ticker']} 5 — купить\n"
         f"/sell {ex['ticker']} 5 — продать\n"
         f"/portfolio — мой портфель"
@@ -703,7 +703,7 @@ def _ex_replace_market(chat_id: int, user_id: int, exchange_id: int = 1):
         msg = bot.send_photo(
             chat_id,
             photo,
-            caption=_ex_market_text(exchange_id),
+            caption=_ex_market_text(exchange_id, chat_id),
             reply_markup=_ex_markup(),
         )
 
@@ -758,6 +758,37 @@ def handle_exchange_bonus(message: Message) -> None:
     conn.commit()
     conn.close()
     bot.send_message(message.chat.id, f"🎁 <b>Ежедневный бонус!</b>\n\n+{EXCHANGE_DAILY_BONUS:,.0f} ₽\n💰 Баланс: <b>{new_balance:,.2f} ₽</b>")
+
+
+@bot.message_handler(commands=["give", "give_money", "выдать"])
+def handle_exchange_admin_give(message: Message) -> None:
+    """Выдать виртуальные деньги из воздуха. Только глобальным админам."""
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ Эта команда доступна только администраторам.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        bot.send_message(message.chat.id, "❓ Формат: <code>/выдать 1000000</code>")
+        return
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Сумма должна быть числом.")
+        return
+    if amount <= 0 or amount > 1_000_000_000_000:
+        bot.send_message(message.chat.id, "❌ Сумма должна быть от 1 до 1 000 000 000 000 ₽.")
+        return
+    user_id = message.from_user.id
+    _ex_ensure_trader(user_id)
+    conn = _ex_db()
+    conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?", (amount, user_id))
+    row = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    bot.send_message(
+        message.chat.id,
+        f"💸 <b>Деньги выданы!</b>\n\n+{amount:,.2f} ₽\n💰 Новый баланс: <b>{float(row['balance']):,.2f} ₽</b>"
+    )
 
 
 @bot.message_handler(commands=["balance"])
@@ -949,7 +980,7 @@ def handle_exchanges(message: Message) -> None:
     conn.close()
     lines = ["🏦 <b>Все биржи</b>\n"]
     for r in rows:
-        lines.append(f"• <code>{r['ticker']}</code> — {html.escape(r['name'])}: <b>{r['price']:,.2f} ₽</b>\n  Владелец: <code>{r['owner_id']}</code>")
+        lines.append(f"• <code>{r['ticker']}</code> — {html.escape(r['name'])}: <b>{r['price']:,.2f} ₽</b>\n  Владелец: {_mention_user(message.chat.id, int(r['owner_id']))}")
     bot.send_message(message.chat.id, "\n".join(lines))
 
 
@@ -969,7 +1000,7 @@ def handle_exchange_top(message: Message) -> None:
     result.sort(reverse=True)
     lines = ["🏆 <b>TOP TRADERS</b>\n"]
     for i, (total, uid) in enumerate(result[:20], 1):
-        lines.append(f"{i}. <code>{uid}</code> — <b>{total:,.2f} ₽</b>")
+        lines.append(f"{i}. {_mention_user(message.chat.id, uid)} — <b>{total:,.2f} ₽</b>")
     bot.send_message(message.chat.id, "\n".join(lines) if len(lines) > 1 else "🏆 Пока рейтинг пуст.")
 
 
@@ -1068,9 +1099,117 @@ def _play_dice(chat_id: int, user_id: int) -> None:
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("marry_")))
 def handle_marriage_callback_direct(call: CallbackQuery) -> None:
-    """Dedicated marriage callback handler. Registered before the catch-all handler."""
+    """Обработчик кнопок брака. Сначала сразу закрываем 'часики' Telegram."""
     logger.info("Marriage button pressed: data=%r user=%s", call.data, call.from_user.id)
-    handle_social_marriage_callback(call)
+
+    # Telegram показывает загрузку на кнопке, пока бот не ответит на callback.
+    # Отвечаем СРАЗУ, ещё до работы с SQLite и редактирования сообщения.
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        logger.exception("Failed to acknowledge marriage callback")
+
+    try:
+        action, pid_raw = call.data.split(":", 1)
+        pid = int(pid_raw)
+
+        conn = _social_db()
+        proposal = conn.execute(
+            "SELECT * FROM social_marriage_proposals WHERE id=?",
+            (pid,),
+        ).fetchone()
+
+        if not proposal or proposal["status"] != "pending":
+            conn.close()
+            try:
+                bot.answer_callback_query(call.id, "Предложение уже обработано.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        if call.from_user.id != proposal["to_user"]:
+            conn.close()
+            try:
+                bot.answer_callback_query(call.id, "Это предложение не для тебя.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        if action == "marry_no":
+            conn.execute(
+                "UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",
+                (pid,),
+            )
+            conn.commit()
+            conn.close()
+
+            bot.edit_message_text(
+                "❌ <b>Предложение отклонено.</b>",
+                call.message.chat.id,
+                call.message.message_id,
+            )
+            return
+
+        if action != "marry_yes":
+            conn.close()
+            return
+
+        if (
+            _social_active_marriage(conn, proposal["chat_id"], proposal["from_user"])
+            or _social_active_marriage(conn, proposal["chat_id"], proposal["to_user"])
+        ):
+            conn.execute(
+                "UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",
+                (pid,),
+            )
+            conn.commit()
+            conn.close()
+            try:
+                bot.answer_callback_query(
+                    call.id,
+                    "У одного из вас уже есть активный брак.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+
+        now = _social_now().isoformat(sep=" ")
+        conn.execute(
+            "UPDATE social_marriage_proposals SET status='accepted' WHERE id=?",
+            (pid,),
+        )
+        conn.execute(
+            "INSERT INTO social_marriages(chat_id,user1,user2,created_at,active) VALUES(?,?,?,?,1)",
+            (
+                proposal["chat_id"],
+                proposal["from_user"],
+                proposal["to_user"],
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        bot.edit_message_text(
+            f"💍 <b>Брак заключён!</b>\\n\\n"
+            f"{_social_user_label(proposal['chat_id'], proposal['from_user'])} ❤️ "
+            f"{_social_user_label(proposal['chat_id'], proposal['to_user'])}\\n"
+            f"🌱 Стаж: <b>0 дней</b> — 💚 Зелёные",
+            call.message.chat.id,
+            call.message.message_id,
+        )
+
+    except Exception:
+        logger.exception("Marriage button error")
+        try:
+            bot.answer_callback_query(
+                call.id,
+                "❌ Не удалось обработать кнопку. Попробуй ещё раз.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1382,7 +1521,7 @@ def handle_rank(message: Message) -> None:
             uid, rank = row[0], row[1]
         else:
             uid, rank = row["user_id"], row["rank"]
-        lines.append(f"• User_{uid} — {RANK_NAMES.get(rank, f'Ранг {rank}')}")
+        lines.append(f"• {_mention_user(chat_id, int(uid))} — {RANK_NAMES.get(rank, f'Ранг {rank}')}")
     bot.send_message(chat_id, "\n".join(lines))
 
 @bot.message_handler(commands=["setrank"])
@@ -1550,6 +1689,41 @@ def _social_now():
     return datetime.now().replace(microsecond=0)
 
 
+def _mention_user(chat_id: int | None, user_id: int, name: str | None = None) -> str:
+    """Единый кликабельный Telegram-mention для любого места бота."""
+    display = name or "Пользователь"
+
+    # Сначала берём сохранённые данные соцсистемы — это работает даже там,
+    # где get_chat_member недоступен (например, в некоторых сообщениях биржи).
+    if chat_id is not None:
+        try:
+            conn = _social_db()
+            row = conn.execute(
+                "SELECT username,first_name,last_name FROM social_users WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            ).fetchone()
+            conn.close()
+            if row:
+                if row["username"]:
+                    display = "@" + row["username"]
+                else:
+                    display = " ".join(x for x in (row["first_name"], row["last_name"]) if x).strip() or display
+        except Exception:
+            pass
+
+        try:
+            member = bot.get_chat_member(chat_id, user_id)
+            user = member.user
+            if user.username:
+                display = "@" + user.username
+            else:
+                display = " ".join(x for x in (user.first_name, user.last_name) if x).strip() or display
+        except Exception:
+            pass
+
+    return f'<a href="tg://user?id={user_id}">{html.escape(str(display))}</a>'
+
+
 def _social_user_label(chat_id: int, user_id: int) -> str:
     conn = _social_db()
     row = conn.execute(
@@ -1559,11 +1733,11 @@ def _social_user_label(chat_id: int, user_id: int) -> str:
     conn.close()
     if row:
         if row["username"]:
-            return "@" + html.escape(row["username"])
+            return _mention_user(chat_id, user_id, "@" + row["username"])
         name = " ".join(x for x in (row["first_name"], row["last_name"]) if x).strip()
         if name:
-            return html.escape(name)
-    return f"<code>{user_id}</code>"
+            return _mention_user(chat_id, user_id, name)
+    return _mention_user(chat_id, user_id)
 
 
 def _social_register(message: Message) -> None:
@@ -1796,11 +1970,12 @@ def handle_social_profile(message: Message) -> None:
     week = _social_activity_for_user(message.chat.id,target,"week")
     month = _social_activity_for_user(message.chat.id,target,"month")
     total = _social_activity_for_user(message.chat.id,target,"all")
-    name = row["username"] if row and row["username"] else (row["first_name"] if row else f"User {target}")
+    name = row["username"] if row and row["username"] else (row["first_name"] if row else "Пользователь")
     display_name = ("@" + name) if row and row["username"] else name
+    mention = _mention_user(message.chat.id, target, display_name)
     path=os.path.join(SOCIAL_GRAPH_DIR,f"profile_{message.chat.id}_{target}.png")
     _social_profile_png(path,display_name,day,week,month,total)
-    caption=(f"👤 <b>Профиль {html.escape(str(display_name))}</b>\n\n"
+    caption=(f"👤 <b>Профиль {mention}</b>\n\n"
              f"💬 Сегодня: <b>{day}</b> сообщений\n"
              f"📅 За неделю: <b>{week}</b>\n"
              f"🗓 За месяц: <b>{month}</b>\n"
@@ -1878,9 +2053,10 @@ def handle_social_top(message: Message, period: str = "all") -> None:
     lines=[f"<b>{title}</b>\n"]
     medals=["🥇","🥈","🥉"]
     for i,r in enumerate(rows,1):
-        label=("@"+r['username']) if r['username'] else (r['first_name'] or f"User {r['user_id']}")
+        raw_label=("@"+r['username']) if r['username'] else (r['first_name'] or "Пользователь")
+        label=_mention_user(message.chat.id, int(r['user_id']), raw_label)
         prefix=medals[i-1] if i<=3 else f"{i}."
-        lines.append(f"{prefix} <b>{html.escape(str(label))}</b> — <b>{r['messages']}</b> сообщ.")
+        lines.append(f"{prefix} {label} — <b>{r['messages']}</b> сообщ.")
     bot.send_message(message.chat.id,"\n".join(lines))
 
 
