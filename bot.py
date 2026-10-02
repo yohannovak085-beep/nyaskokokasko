@@ -494,6 +494,11 @@ def _ex_change_price(conn, exchange_id: int, action_bias: float = 0.0):
 
 
 def _ex_chart(exchange_id: int):
+    """
+    Создаёт PNG-график без matplotlib/Pillow.
+    Использует только стандартную библиотеку Python, поэтому /market
+    работает даже если Bothost не установил дополнительные библиотеки.
+    """
     import os
     os.makedirs(EXCHANGE_GRAPH_DIR, exist_ok=True)
 
@@ -513,51 +518,128 @@ def _ex_chart(exchange_id: int):
     change = ((prices[-1] / prices[0]) - 1.0) * 100.0 if len(prices) > 1 and prices[0] else 0.0
     path = os.path.join(EXCHANGE_GRAPH_DIR, f"market_{exchange_id}.png")
 
-    # Основной вариант — красивый график matplotlib.
-    if plt is not None:
-        fig, ax = plt.subplots(figsize=(10, 5.4), dpi=130)
-        ax.plot(range(len(prices)), prices, linewidth=2.5)
-        ax.fill_between(range(len(prices)), prices, min(prices) * 0.995, alpha=0.12)
-        ax.grid(True, alpha=0.22)
-        ax.set_title(f"{ex['name']}  •  {ex['ticker']}   {prices[-1]:,.2f} ₽   ({change:+.2f}%)")
-        ax.set_xlabel("Движение рынка")
-        ax.set_ylabel("Цена, ₽")
-        fig.tight_layout()
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-        return path
-
-    # Резервный вариант — Pillow, если matplotlib не установлен.
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError as exc:
-        raise RuntimeError("Не установлен модуль для построения графика. Установи matplotlib или Pillow.") from exc
-
+    # --- PNG рисуем вручную: никаких внешних библиотек не требуется. ---
     width, height = 1200, 650
-    image = Image.new("RGB", (width, height), "#111827")
-    draw = ImageDraw.Draw(image)
-    margin = 80
-    chart_w = width - margin * 2
-    chart_h = height - 190
+    bg = (17, 24, 39)
+    grid = (55, 65, 81)
+    line_color = (34, 197, 94) if change >= 0 else (239, 68, 68)
+    area_color = (31, 65, 48) if change >= 0 else (70, 35, 42)
+
+    pixels = bytearray(bg * (width * height))
+
+    def set_px(x, y, color):
+        if 0 <= x < width and 0 <= y < height:
+            i = (y * width + x) * 3
+            pixels[i:i + 3] = bytes(color)
+
+    def rect(x1, y1, x2, y2, color):
+        x1, x2 = max(0, int(x1)), min(width - 1, int(x2))
+        y1, y2 = max(0, int(y1)), min(height - 1, int(y2))
+        if x1 > x2 or y1 > y2:
+            return
+        row = bytes(color) * (x2 - x1 + 1)
+        for yy in range(y1, y2 + 1):
+            i = (yy * width + x1) * 3
+            pixels[i:i + len(row)] = row
+
+    def line(x1, y1, x2, y2, color, thickness=3):
+        # DDA — достаточно для простого биржевого графика.
+        steps = max(abs(int(x2) - int(x1)), abs(int(y2) - int(y1)), 1)
+        for s in range(steps + 1):
+            t = s / steps
+            x = round(x1 + (x2 - x1) * t)
+            y = round(y1 + (y2 - y1) * t)
+            r = max(0, thickness // 2)
+            rect(x - r, y - r, x + r, y + r, color)
+
+    margin_left, margin_right = 70, 45
+    margin_top, margin_bottom = 55, 55
+    chart_left = margin_left
+    chart_right = width - margin_right
+    chart_top = margin_top
+    chart_bottom = height - margin_bottom
+
+    # Рамка и сетка.
+    rect(chart_left, chart_top, chart_right, chart_top + 2, grid)
+    rect(chart_left, chart_bottom - 2, chart_right, chart_bottom, grid)
+    rect(chart_left, chart_top, chart_left + 2, chart_bottom, grid)
+    rect(chart_right - 2, chart_top, chart_right, chart_bottom, grid)
+
+    for j in range(1, 5):
+        y = chart_top + (chart_bottom - chart_top) * j / 5
+        rect(chart_left, y, chart_right, y + 1, grid)
+
+    for j in range(1, 6):
+        x = chart_left + (chart_right - chart_left) * j / 6
+        rect(x, chart_top, x + 1, chart_bottom, grid)
+
     low, high = min(prices), max(prices)
     if high == low:
-        high += 1
-        low -= 1
+        pad = max(1.0, abs(high) * 0.02)
+        low -= pad
+        high += pad
+    else:
+        pad = (high - low) * 0.08
+        low -= pad
+        high += pad
 
     points = []
+    denom = max(1, len(prices) - 1)
     for i, price in enumerate(prices):
-        x = margin + (chart_w * i / max(1, len(prices) - 1))
-        y = margin + (high - price) / (high - low) * chart_h
+        x = chart_left + (chart_right - chart_left) * i / denom
+        y = chart_bottom - (price - low) / (high - low) * (chart_bottom - chart_top)
         points.append((x, y))
 
-    draw.text((margin, 25), f"{ex['name']} • {ex['ticker']}", fill="white")
-    draw.text((margin, 55), f"{prices[-1]:,.2f} ₽   ({change:+.2f}%)", fill="white")
-    draw.rectangle((margin, margin + 40, width - margin, margin + 40 + chart_h), outline="#374151", width=2)
-    if len(points) > 1:
-        draw.line(points, fill="#22c55e" if change >= 0 else "#ef4444", width=6)
-    image.save(path, "PNG")
-    return path
+    # Лёгкая заливка под линией.
+    if points:
+        for i in range(len(points) - 1):
+            x1, y1 = points[i]
+            x2, y2 = points[i + 1]
+            steps = max(1, int(abs(x2 - x1)))
+            for s in range(steps + 1):
+                t = s / steps
+                x = round(x1 + (x2 - x1) * t)
+                y = round(y1 + (y2 - y1) * t)
+                rect(x, min(y, chart_bottom), x + 1, chart_bottom, area_color)
 
+    # Линия курса.
+    for i in range(len(points) - 1):
+        line(*points[i], *points[i + 1], line_color, thickness=7)
+
+    # Последняя точка.
+    if points:
+        x, y = points[-1]
+        rect(x - 7, y - 7, x + 7, y + 7, line_color)
+        rect(x - 3, y - 3, x + 3, y + 3, (255, 255, 255))
+
+    # Заголовок/цифры находятся в caption Telegram, поэтому шрифты не нужны.
+
+    def png_chunk(kind, data):
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", binascii.crc32(kind + data) & 0xffffffff)
+        )
+
+    raw = bytearray()
+    row_bytes = width * 3
+    for y in range(height):
+        raw.append(0)  # filter type
+        start = y * row_bytes
+        raw.extend(pixels[start:start + row_bytes])
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + png_chunk(b"IEND", b"")
+    )
+
+    with open(path, "wb") as f:
+        f.write(png)
+
+    return path
 
 def _ex_market_text(exchange_id: int):
     conn = _ex_db()
