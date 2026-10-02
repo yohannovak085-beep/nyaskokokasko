@@ -1066,16 +1066,18 @@ def _play_dice(chat_id: int, user_id: int) -> None:
     )
     bot.send_message(chat_id, result, reply_markup=markup)
 
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("marry_")))
+def handle_marriage_callback_direct(call: CallbackQuery) -> None:
+    """Dedicated marriage callback handler. Registered before the catch-all handler."""
+    logger.info("Marriage button pressed: data=%r user=%s", call.data, call.from_user.id)
+    handle_social_marriage_callback(call)
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call: CallbackQuery) -> None:
     user_id = call.from_user.id
     chat_id = call.message.chat.id
 
-    # Социальные кнопки должны обрабатываться раньше общего callback-хендлера.
-    # Этот хендлер зарегистрирован раньше функции брака, поэтому делегируем сюда.
-    if call.data and call.data.startswith("marry_"):
-        handle_social_marriage_callback(call)
-        return
     logger.info("Клик от пользователя: %s (@%s), ID: %s", call.from_user.first_name, call.from_user.username, user_id)
 
     if call.data.startswith("verify:"):
