@@ -371,6 +371,9 @@ def handle_search(message: Message) -> None:
 
 import sqlite3
 import random
+import struct
+import binascii
+import zlib
 from datetime import datetime, date
 
 try:
