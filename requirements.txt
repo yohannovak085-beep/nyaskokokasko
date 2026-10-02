@@ -1,2 +1,4 @@
 pyTelegramBotAPI
 python-dotenv
+Pillow
+matplotlib
