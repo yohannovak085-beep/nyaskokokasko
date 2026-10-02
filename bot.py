@@ -494,11 +494,9 @@ def _ex_change_price(conn, exchange_id: int, action_bias: float = 0.0):
 
 
 def _ex_chart(exchange_id: int):
-    if plt is None:
-        raise RuntimeError("Для графиков нужна библиотека matplotlib. Установи: pip install matplotlib")
-
     import os
     os.makedirs(EXCHANGE_GRAPH_DIR, exist_ok=True)
+
     conn = _ex_db()
     ex = conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
     rows = conn.execute(
@@ -507,25 +505,57 @@ def _ex_chart(exchange_id: int):
     ).fetchall()
     conn.close()
 
+    if not ex:
+        raise RuntimeError("Биржа не найдена")
+
     rows = list(reversed(rows))
     prices = [float(r["price"]) for r in rows] or [float(ex["price"])]
-    if len(prices) > 1 and prices[0] != 0:
-        change = (prices[-1] / prices[0] - 1.0) * 100.0
-    else:
-        change = 0.0
-
-    fig, ax = plt.subplots(figsize=(10, 5.4), dpi=130)
-    ax.plot(range(len(prices)), prices, linewidth=2.5)
-    ax.fill_between(range(len(prices)), prices, min(prices) * 0.995, alpha=0.12)
-    ax.grid(True, alpha=0.22)
-    ax.set_title(f"{ex['name']}  •  {ex['ticker']}   {prices[-1]:,.2f} ₽   ({change:+.2f}%)")
-    ax.set_xlabel("Движение рынка")
-    ax.set_ylabel("Цена, ₽")
-    fig.tight_layout()
-
+    change = ((prices[-1] / prices[0]) - 1.0) * 100.0 if len(prices) > 1 and prices[0] else 0.0
     path = os.path.join(EXCHANGE_GRAPH_DIR, f"market_{exchange_id}.png")
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
+
+    # Основной вариант — красивый график matplotlib.
+    if plt is not None:
+        fig, ax = plt.subplots(figsize=(10, 5.4), dpi=130)
+        ax.plot(range(len(prices)), prices, linewidth=2.5)
+        ax.fill_between(range(len(prices)), prices, min(prices) * 0.995, alpha=0.12)
+        ax.grid(True, alpha=0.22)
+        ax.set_title(f"{ex['name']}  •  {ex['ticker']}   {prices[-1]:,.2f} ₽   ({change:+.2f}%)")
+        ax.set_xlabel("Движение рынка")
+        ax.set_ylabel("Цена, ₽")
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    # Резервный вариант — Pillow, если matplotlib не установлен.
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError("Не установлен модуль для построения графика. Установи matplotlib или Pillow.") from exc
+
+    width, height = 1200, 650
+    image = Image.new("RGB", (width, height), "#111827")
+    draw = ImageDraw.Draw(image)
+    margin = 80
+    chart_w = width - margin * 2
+    chart_h = height - 190
+    low, high = min(prices), max(prices)
+    if high == low:
+        high += 1
+        low -= 1
+
+    points = []
+    for i, price in enumerate(prices):
+        x = margin + (chart_w * i / max(1, len(prices) - 1))
+        y = margin + (high - price) / (high - low) * chart_h
+        points.append((x, y))
+
+    draw.text((margin, 25), f"{ex['name']} • {ex['ticker']}", fill="white")
+    draw.text((margin, 55), f"{prices[-1]:,.2f} ₽   ({change:+.2f}%)", fill="white")
+    draw.rectangle((margin, margin + 40, width - margin, margin + 40 + chart_h), outline="#374151", width=2)
+    if len(points) > 1:
+        draw.line(points, fill="#22c55e" if change >= 0 else "#ef4444", width=6)
+    image.save(path, "PNG")
     return path
 
 
@@ -653,8 +683,16 @@ def handle_exchange_balance(message: Message) -> None:
 
 @bot.message_handler(commands=["market"])
 def handle_exchange_market(message: Message) -> None:
-    _ex_require_user(message)
-    _ex_replace_market(message.chat.id, message.from_user.id, 1)
+    try:
+        _ex_require_user(message)
+        _ex_replace_market(message.chat.id, message.from_user.id, 1)
+    except Exception as exc:
+        logger.exception("/market error: %s", exc)
+        bot.send_message(
+            message.chat.id,
+            "❌ Не удалось открыть рынок.\n\n"
+            f"Техническая ошибка: <code>{html.escape(str(exc))}</code>"
+        )
 
 
 @bot.message_handler(commands=["portfolio"])
