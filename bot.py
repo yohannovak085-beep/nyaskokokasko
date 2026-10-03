@@ -13,6 +13,8 @@ so it can check member status via getChatMember.
 import os
 import time
 import html
+import io
+import random
 import logging
 from dotenv import load_dotenv
 import telebot
@@ -241,11 +243,11 @@ def handle_start(message: Message) -> None:
             f"👋 <b>Привет! Я Berlions чат-бот.</b>\n\n"
             f"📋 <b>Доступные команды:</b>\n"
             f"• /start — приветствие и главное меню\n"
-            f"• /help — список доступных команд\n"
-            f"• /search <i>запрос</i> — поиск игры или контента\n"
+            f"• /помощь — список доступных команд\n"
+            f"• /поиск <i>запрос</i> — поиск игры или контента\n"
             f"• /dice — сыграть в кости 🎲\n• /profile — профиль и активность\n• /top — топ активности\n• /topmoney — топ капитала биржи\n\n"
             f"🔍 <b>Поиск:</b>\n"
-            f"Например: <code>/search standoff 2</code>\n\n"
+            f"Например: <code>/поиск standoff 2</code>\n\n"
             f"🎲 Нажми кнопку ниже, чтобы сразу сыграть."
         )
         
@@ -265,7 +267,7 @@ def handle_start(message: Message) -> None:
 
 # ── /help ─────────────────────────────────────────────────────────────────────
 
-@bot.message_handler(commands=["help"])
+@bot.message_handler(commands=["help", "помощь"])
 def handle_help(message: Message) -> None:
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🎲 Сыграть в кости", callback_data="play_dice"))
@@ -273,16 +275,16 @@ def handle_help(message: Message) -> None:
         message.chat.id,
         "📋 <b>Доступные команды:</b>\n\n"
         "• /start — главное меню\n"
-        "• /help — список доступных команд\n"
-        "• /search <i>запрос</i> — поиск контента\n"
-        "• /dice — сыграть в кости 🎲\n\n"
-        "Пример поиска: <code>/search minecraft</code>",
+        "• /помощь — список доступных команд\n"
+        "• /поиск <i>запрос</i> — поиск контента\n"
+        "• /кости — сыграть в кости 🎲\n\n"
+        "Пример поиска: <code>/поиск minecraft</code>",
         reply_markup=markup,
     )
 
 # ── /search (С анимацией и умным поиском) ─────────────────────────────────────
 
-@bot.message_handler(commands=["search"])
+@bot.message_handler(commands=["search", "поиск"])
 def handle_search(message: Message) -> None:
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -367,22 +369,15 @@ def handle_search(message: Message) -> None:
     )
 
 # ── BERLIONS EXCHANGE SYSTEM ───────────────────────────────────────────────────
-# Отдельный функциональный блок. Старые функции бота не изменяет.
+# Компании, акции, владельцы, спрос/предложение и графики.
+# Сохраняет старые команды /buy, /sell, /market, /portfolio и т.д.
 
 import sqlite3
-import random
+import math
 import struct
 import binascii
 import zlib
 from datetime import datetime, date
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except ImportError:
-    matplotlib = None
-    plt = None
 
 EXCHANGE_DB = "exchange.db"
 EXCHANGE_GRAPH_DIR = "exchange_graphs"
@@ -391,12 +386,24 @@ EXCHANGE_DAILY_BONUS = 1_000.0
 EXCHANGE_DEFAULT_PRICE = 100.0
 EXCHANGE_DEFAULT_TICKER = "BERL"
 EXCHANGE_MAX_TRADE = 100_000
+EXCHANGE_DEFAULT_TOTAL_SHARES = 1_000_000
+EXCHANGE_OWNER_SHARES = 700_000
+EXCHANGE_FLOAT_SHARES = 300_000
 
 
 def _ex_db():
     conn = sqlite3.connect(EXCHANGE_DB)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _ex_has_column(conn, table: str, column: str) -> bool:
+    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})").fetchall())
+
+
+def _ex_add_column(conn, table: str, column: str, definition: str) -> None:
+    if not _ex_has_column(conn, table, column):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _ex_init_db():
@@ -446,18 +453,29 @@ def _ex_init_db():
     );
     """)
 
-    # Базовая биржа Berlions.
-    row = conn.execute("SELECT id FROM ex_exchanges WHERE ticker=?", (EXCHANGE_DEFAULT_TICKER,)).fetchone()
+    # Миграция старой базы: существующие таблицы не удаляем.
+    _ex_add_column(conn, "ex_exchanges", "total_shares", "INTEGER NOT NULL DEFAULT 1000000")
+    _ex_add_column(conn, "ex_exchanges", "treasury_shares", "INTEGER NOT NULL DEFAULT 1000000")
+    _ex_add_column(conn, "ex_exchanges", "description", "TEXT NOT NULL DEFAULT ''")
+    _ex_add_column(conn, "ex_exchanges", "active", "INTEGER NOT NULL DEFAULT 1")
+
+    row = conn.execute("SELECT id,total_shares,treasury_shares FROM ex_exchanges WHERE ticker=?", (EXCHANGE_DEFAULT_TICKER,)).fetchone()
     if row is None:
         cur = conn.execute(
-            "INSERT INTO ex_exchanges(owner_id,name,ticker,price,created_at) VALUES(?,?,?,?,?)",
-            (0, "Berlions", EXCHANGE_DEFAULT_TICKER, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
+            "INSERT INTO ex_exchanges(owner_id,name,ticker,price,created_at,total_shares,treasury_shares,description,active) VALUES(?,?,?,?,?,?,?,?,1)",
+            (0, "Berlions", EXCHANGE_DEFAULT_TICKER, EXCHANGE_DEFAULT_PRICE,
+             datetime.now().isoformat(timespec="seconds"), EXCHANGE_DEFAULT_TOTAL_SHARES,
+             EXCHANGE_DEFAULT_TOTAL_SHARES, "Главная акция экосистемы Berlions.")
         )
         exchange_id = cur.lastrowid
         conn.execute(
             "INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)",
             (exchange_id, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
         )
+    else:
+        # Старую BERL оставляем полностью ликвидной: никто не должен внезапно получить чужие акции.
+        conn.execute("UPDATE ex_exchanges SET total_shares=COALESCE(total_shares,?), treasury_shares=COALESCE(treasury_shares,total_shares,?), active=COALESCE(active,1) WHERE id=?",
+                     (EXCHANGE_DEFAULT_TOTAL_SHARES, EXCHANGE_DEFAULT_TOTAL_SHARES, row["id"]))
     conn.commit()
     conn.close()
 
@@ -474,20 +492,59 @@ def _ex_ensure_trader(user_id: int):
     return row
 
 
+def _ex_add_work_column():
+    conn = _ex_db()
+    _ex_add_column(conn, "ex_traders", "last_work", "TEXT")
+    conn.commit(); conn.close()
+
+_ex_add_work_column()
+
+
 def _ex_escape(value):
     return html.escape(str(value))
 
 
+def _ex_user_mention(chat_id: int, user_id: int, fallback: str = "Пользователь") -> str:
+    """Настоящее Telegram-упоминание по ID с приоритетом данным текущего чата."""
+    display = None
+    try:
+        conn = _ex_db()
+        # social_users уже создаётся при старте до обработки сообщений.
+        row = conn.execute("SELECT username,first_name,last_name FROM social_users WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone()
+        conn.close()
+        if row:
+            if row["username"]: display = "@" + row["username"]
+            else: display = " ".join(x for x in (row["first_name"],row["last_name"]) if x).strip() or None
+    except Exception:
+        pass
+    if not display:
+        try:
+            member = bot.get_chat_member(chat_id, user_id)
+            user = member.user
+            display = f"@{user.username}" if user.username else (user.first_name or None)
+        except Exception:
+            pass
+    if not display:
+        display = fallback
+    return f'<a href="tg://user?id={int(user_id)}">{html.escape(str(display))}</a>'
+
+
 def _ex_change_price(conn, exchange_id: int, action_bias: float = 0.0):
-    row = conn.execute("SELECT price FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
+    """Цена двигается от спроса/предложения, а не случайно.
+
+    action_bias > 0: покупка, action_bias < 0: продажа.
+    Величина эффекта растёт примерно как sqrt(объёма/свободных акций),
+    поэтому маленькая сделка почти незаметна, а крупный слив уже влияет на рынок.
+    """
+    row = conn.execute("SELECT price,treasury_shares,active FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
     if not row:
         return None, 0.0
+    old_price = max(0.01, float(row["price"]))
+    if not row["active"]:
+        return old_price, 0.0
 
-    old_price = float(row["price"])
-    shock = random.gauss(0, 0.035) + action_bias
-    shock = max(-0.12, min(0.12, shock))
-    new_price = max(1.0, old_price * (1.0 + shock))
-
+    effect = max(-0.30, min(0.30, float(action_bias)))
+    new_price = max(1.0, old_price * (1.0 + effect))
     conn.execute("UPDATE ex_exchanges SET price=? WHERE id=?", (new_price, exchange_id))
     conn.execute(
         "INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)",
@@ -496,542 +553,460 @@ def _ex_change_price(conn, exchange_id: int, action_bias: float = 0.0):
     return new_price, ((new_price / old_price) - 1.0) * 100.0
 
 
+def _ex_trade_impact(shares: int, available_before: int) -> float:
+    """Процентный impact одной сделки. Покупка +, продажа -."""
+    base = max(10_000, int(available_before or 10_000))
+    magnitude = 0.08 * math.sqrt(max(1, shares) / base)
+    return min(0.25, magnitude)
+
+
 def _ex_chart(exchange_id: int):
-    """
-    Создаёт PNG-график без matplotlib/Pillow.
-    Использует только стандартную библиотеку Python, поэтому /market
-    работает даже если Bothost не установил дополнительные библиотеки.
-    """
+    """PNG-график только стандартной библиотекой Python."""
     import os
     os.makedirs(EXCHANGE_GRAPH_DIR, exist_ok=True)
-
     conn = _ex_db()
     ex = conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
     rows = conn.execute(
-        "SELECT price,ts FROM ex_history WHERE exchange_id=? ORDER BY id DESC LIMIT 40",
+        "SELECT price,ts FROM ex_history WHERE exchange_id=? ORDER BY id DESC LIMIT 80",
         (exchange_id,),
     ).fetchall()
     conn.close()
-
     if not ex:
-        raise RuntimeError("Биржа не найдена")
-
+        raise RuntimeError("Компания не найдена")
     rows = list(reversed(rows))
     prices = [float(r["price"]) for r in rows] or [float(ex["price"])]
     change = ((prices[-1] / prices[0]) - 1.0) * 100.0 if len(prices) > 1 and prices[0] else 0.0
     path = os.path.join(EXCHANGE_GRAPH_DIR, f"market_{exchange_id}.png")
 
-    # --- PNG рисуем вручную: никаких внешних библиотек не требуется. ---
     width, height = 1200, 650
-    bg = (17, 24, 39)
-    grid = (55, 65, 81)
+    bg = (17, 24, 39); grid = (55, 65, 81)
     line_color = (34, 197, 94) if change >= 0 else (239, 68, 68)
     area_color = (31, 65, 48) if change >= 0 else (70, 35, 42)
-
     pixels = bytearray(bg * (width * height))
-
-    def set_px(x, y, color):
-        if 0 <= x < width and 0 <= y < height:
-            i = (y * width + x) * 3
-            pixels[i:i + 3] = bytes(color)
 
     def rect(x1, y1, x2, y2, color):
         x1, x2 = max(0, int(x1)), min(width - 1, int(x2))
         y1, y2 = max(0, int(y1)), min(height - 1, int(y2))
-        if x1 > x2 or y1 > y2:
-            return
-        row = bytes(color) * (x2 - x1 + 1)
+        if x2 < x1 or y2 < y1: return
         for yy in range(y1, y2 + 1):
-            i = (yy * width + x1) * 3
-            pixels[i:i + len(row)] = row
+            start = (yy * width + x1) * 3
+            pixels[start:start + (x2 - x1 + 1) * 3] = bytes(color) * (x2 - x1 + 1)
 
-    def line(x1, y1, x2, y2, color, thickness=3):
-        # DDA — достаточно для простого биржевого графика.
-        steps = max(abs(int(x2) - int(x1)), abs(int(y2) - int(y1)), 1)
-        for s in range(steps + 1):
-            t = s / steps
-            x = round(x1 + (x2 - x1) * t)
-            y = round(y1 + (y2 - y1) * t)
+    def line(x1, y1, x2, y2, color, thickness=4):
+        steps = max(1, int(max(abs(x2-x1), abs(y2-y1))))
+        for i in range(steps + 1):
+            t = i / steps
+            x = round(x1 + (x2-x1)*t); y = round(y1 + (y2-y1)*t)
             r = max(0, thickness // 2)
-            rect(x - r, y - r, x + r, y + r, color)
+            rect(x-r, y-r, x+r, y+r, color)
 
-    margin_left, margin_right = 70, 45
-    margin_top, margin_bottom = 55, 55
-    chart_left = margin_left
-    chart_right = width - margin_right
-    chart_top = margin_top
-    chart_bottom = height - margin_bottom
-
-    # Рамка и сетка.
-    rect(chart_left, chart_top, chart_right, chart_top + 2, grid)
-    rect(chart_left, chart_bottom - 2, chart_right, chart_bottom, grid)
-    rect(chart_left, chart_top, chart_left + 2, chart_bottom, grid)
-    rect(chart_right - 2, chart_top, chart_right, chart_bottom, grid)
-
+    ml, mr, mt, mb = 70, 45, 55, 55
+    left, right, top, bottom = ml, width-mr, mt, height-mb
+    rect(left, top, right, top+2, grid); rect(left, bottom-2, right, bottom, grid)
+    rect(left, top, left+2, bottom, grid); rect(right-2, top, right, bottom, grid)
     for j in range(1, 5):
-        y = chart_top + (chart_bottom - chart_top) * j / 5
-        rect(chart_left, y, chart_right, y + 1, grid)
-
+        y = top + (bottom-top)*j/5; rect(left, y, right, y+1, grid)
     for j in range(1, 6):
-        x = chart_left + (chart_right - chart_left) * j / 6
-        rect(x, chart_top, x + 1, chart_bottom, grid)
-
+        x = left + (right-left)*j/6; rect(x, top, x+1, bottom, grid)
     low, high = min(prices), max(prices)
     if high == low:
-        pad = max(1.0, abs(high) * 0.02)
-        low -= pad
-        high += pad
+        pad = max(1.0, abs(high)*0.02); low -= pad; high += pad
     else:
-        pad = (high - low) * 0.08
-        low -= pad
-        high += pad
-
+        pad = (high-low)*0.08; low -= pad; high += pad
     points = []
-    denom = max(1, len(prices) - 1)
+    denom = max(1, len(prices)-1)
     for i, price in enumerate(prices):
-        x = chart_left + (chart_right - chart_left) * i / denom
-        y = chart_bottom - (price - low) / (high - low) * (chart_bottom - chart_top)
-        points.append((x, y))
-
-    # Лёгкая заливка под линией.
+        x = left + (right-left)*i/denom
+        y = bottom - (price-low)/(high-low)*(bottom-top)
+        points.append((x,y))
+    for i in range(len(points)-1):
+        x1,y1=points[i]; x2,y2=points[i+1]
+        steps=max(1,int(abs(x2-x1)))
+        for s in range(steps+1):
+            t=s/steps; x=round(x1+(x2-x1)*t); y=round(y1+(y2-y1)*t)
+            rect(x, min(y,bottom), x+1, bottom, area_color)
+    for i in range(len(points)-1): line(*points[i], *points[i+1], line_color, thickness=7)
     if points:
-        for i in range(len(points) - 1):
-            x1, y1 = points[i]
-            x2, y2 = points[i + 1]
-            steps = max(1, int(abs(x2 - x1)))
-            for s in range(steps + 1):
-                t = s / steps
-                x = round(x1 + (x2 - x1) * t)
-                y = round(y1 + (y2 - y1) * t)
-                rect(x, min(y, chart_bottom), x + 1, chart_bottom, area_color)
-
-    # Линия курса.
-    for i in range(len(points) - 1):
-        line(*points[i], *points[i + 1], line_color, thickness=7)
-
-    # Последняя точка.
-    if points:
-        x, y = points[-1]
-        rect(x - 7, y - 7, x + 7, y + 7, line_color)
-        rect(x - 3, y - 3, x + 3, y + 3, (255, 255, 255))
-
-    # Заголовок/цифры находятся в caption Telegram, поэтому шрифты не нужны.
+        x,y=points[-1]; rect(x-7,y-7,x+7,y+7,line_color); rect(x-3,y-3,x+3,y+3,(255,255,255))
 
     def png_chunk(kind, data):
-        return (
-            struct.pack(">I", len(data))
-            + kind
-            + data
-            + struct.pack(">I", binascii.crc32(kind + data) & 0xffffffff)
-        )
-
-    raw = bytearray()
-    row_bytes = width * 3
+        return struct.pack(">I",len(data))+kind+data+struct.pack(">I",binascii.crc32(kind+data)&0xffffffff)
+    raw=bytearray(); row_bytes=width*3
     for y in range(height):
-        raw.append(0)  # filter type
-        start = y * row_bytes
-        raw.extend(pixels[start:start + row_bytes])
-
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-        + png_chunk(b"IEND", b"")
-    )
-
-    with open(path, "wb") as f:
-        f.write(png)
-
+        raw.append(0); raw.extend(pixels[y*row_bytes:(y+1)*row_bytes])
+    png=(b"\x89PNG\r\n\x1a\n"+
+         png_chunk(b"IHDR",struct.pack(">IIBBBBB",width,height,8,2,0,0,0))+
+         png_chunk(b"IDAT",zlib.compress(bytes(raw),6))+png_chunk(b"IEND",b""))
+    with open(path,"wb") as f: f.write(png)
     return path
 
-def _ex_market_text(exchange_id: int, chat_id: int | None = None):
-    conn = _ex_db()
-    ex = conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
-    owner = conn.execute("SELECT user_id FROM ex_traders WHERE user_id=?", (ex["owner_id"],)).fetchone()
-    hist = conn.execute(
-        "SELECT price FROM ex_history WHERE exchange_id=? ORDER BY id DESC LIMIT 2",
-        (exchange_id,),
-    ).fetchall()
+
+def _ex_company_row(conn, ticker_or_id):
+    if isinstance(ticker_or_id, int):
+        return conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (ticker_or_id,)).fetchone()
+    return conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?", (str(ticker_or_id).upper(),)).fetchone()
+
+
+def _ex_market_text(exchange_id: int):
+    conn=_ex_db(); ex=conn.execute("SELECT * FROM ex_exchanges WHERE id=?",(exchange_id,)).fetchone()
+    hist=conn.execute("SELECT price FROM ex_history WHERE exchange_id=? ORDER BY id DESC LIMIT 2",(exchange_id,)).fetchall()
     conn.close()
-
-    current = float(ex["price"])
-    previous = float(hist[1]["price"]) if len(hist) > 1 else current
-    change = ((current / previous) - 1.0) * 100 if previous else 0.0
-    arrow = "📈" if change > 0 else "📉" if change < 0 else "➖"
-
-    return (
-        f"🏦 <b>{_ex_escape(ex['name'])}</b>  <code>${_ex_escape(ex['ticker'])}</code>\n"
-        f"💰 Цена: <b>{current:,.2f} ₽</b>\n"
-        f"{arrow} Изменение: <b>{change:+.2f}%</b>\n"
-        f"👤 Владелец: {_mention_user(chat_id, int(ex['owner_id']))}\n\n"
-        f"/buy {ex['ticker']} 5 — купить\n"
-        f"/sell {ex['ticker']} 5 — продать\n"
-        f"/portfolio — мой портфель"
-    )
+    if not ex: return "❌ Компания не найдена."
+    current=float(ex["price"]); previous=float(hist[1]["price"]) if len(hist)>1 else current
+    change=((current/previous)-1)*100 if previous else 0
+    arrow="📈" if change>0 else "📉" if change<0 else "➖"
+    status="🟢 Торги открыты" if ex["active"] else "🔴 Компания закрыта"
+    return (f"🏭 <b>{_ex_escape(ex['name'])}</b>  <code>${_ex_escape(ex['ticker'])}</code>\n"
+            f"{status}\n💰 Цена: <b>{current:,.2f} ₽</b>\n{arrow} Последняя сделка: <b>{change:+.2f}%</b>\n"
+            f"📦 Всего акций: <b>{int(ex['total_shares']):,}</b>\n🛒 В свободной продаже: <b>{int(ex['treasury_shares']):,}</b>\n"
+            f"📊 Капитализация: <b>{current*int(ex['total_shares']):,.2f} ₽</b>\n\n"
+            f"/company {ex['ticker']} — профиль\n/buy {ex['ticker']} 5 — купить\n/sell {ex['ticker']} 5 — продать\n/holders {ex['ticker']} — держатели")
 
 
 def _ex_markup():
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("🔄 Обновить рынок", callback_data="ex_refresh"),
-        InlineKeyboardButton("💼 Портфель", callback_data="ex_portfolio"),
-        InlineKeyboardButton("💰 Бонус", callback_data="ex_bonus"),
-    )
+    markup=InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton("🔄 Обновить рынок",callback_data="ex_refresh"),InlineKeyboardButton("💼 Портфель",callback_data="ex_portfolio"),InlineKeyboardButton("💰 Бонус",callback_data="ex_bonus"))
     return markup
 
 
 def _ex_replace_market(chat_id: int, user_id: int, exchange_id: int = 1):
     _ex_ensure_trader(user_id)
-    conn = _ex_db()
-    ex = conn.execute("SELECT id FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
-    if not ex:
-        exchange_id = 1
-    old = conn.execute(
-        "SELECT market_message_id,market_chat_id FROM ex_traders WHERE user_id=?",
-        (user_id,),
-    ).fetchone()
-    conn.close()
-
+    conn=_ex_db(); ex=conn.execute("SELECT id FROM ex_exchanges WHERE id=?",(exchange_id,)).fetchone()
+    if not ex: exchange_id=1
+    old=conn.execute("SELECT market_message_id,market_chat_id FROM ex_traders WHERE user_id=?",(user_id,)).fetchone(); conn.close()
     if old and old["market_message_id"] and old["market_chat_id"]:
-        try:
-            bot.delete_message(old["market_chat_id"], old["market_message_id"])
-        except Exception:
-            pass
-
-    path = _ex_chart(exchange_id)
-    with open(path, "rb") as photo:
-        msg = bot.send_photo(
-            chat_id,
-            photo,
-            caption=_ex_market_text(exchange_id, chat_id),
-            reply_markup=_ex_markup(),
-        )
-
-    conn = _ex_db()
-    conn.execute(
-        "UPDATE ex_traders SET market_message_id=?,market_chat_id=? WHERE user_id=?",
-        (msg.message_id, chat_id, user_id),
-    )
-    conn.commit()
-    conn.close()
+        try: bot.delete_message(old["market_chat_id"],old["market_message_id"])
+        except Exception: pass
+    path=_ex_chart(exchange_id)
+    with open(path,"rb") as photo:
+        msg=bot.send_photo(chat_id,photo,caption=_ex_market_text(exchange_id),reply_markup=_ex_markup())
+    conn=_ex_db(); conn.execute("UPDATE ex_traders SET market_message_id=?,market_chat_id=? WHERE user_id=?",(msg.message_id,chat_id,user_id)); conn.commit(); conn.close()
 
 
 def _ex_require_user(message):
-    # Биржа не меняет существующую подписочную логику старых команд.
-    _ex_ensure_trader(message.from_user.id)
-    return True
+    _ex_ensure_trader(message.from_user.id); return True
 
 
 @bot.message_handler(commands=["exchange", "биржа"])
 def handle_exchange(message: Message) -> None:
-    if not _ex_require_user(message):
-        return
-    bot.send_message(
-        message.chat.id,
-        "🏦 <b>BERLIONS STOCK EXCHANGE</b>\n\n"
-        "💰 /bonus — ежедневный бонус 1 000 ₽\n"
-        "💵 /balance — баланс\n"
-        "📈 /market — открыть рынок и график\n"
-        "💼 /portfolio — мои акции\n"
-        "🛒 /buy TICKER 5 — купить акции\n"
-        "💸 /sell TICKER 5 — продать акции\n"
-        "🏭 /create_exchange Название TICKER — создать свою биржу\n"
-        "📋 /exchanges — список бирж\n"
-        "🏆 /top — рейтинг игроков\n\n"
-        "Курс меняется после сделок, а график рынка обновляется автоматически."
-    )
+    _ex_require_user(message)
+    bot.send_message(message.chat.id,
+        "🏦 <b>BERLIONS STOCK MARKET</b>\n\n"
+        "💰 /бонус — ежедневный бонус 1 000 ₽\n💵 /баланс — баланс\n💼 /работа — заработать деньги\n📈 /рынок — рынок и график\n"
+        "💼 /портфель — мои акции\n🛒 /купить TICKER 5 — купить\n💸 /продать TICKER 5 — продать\n"
+        "🏭 /создать_компанию Название TICKER — создать компанию\n🏢 /компания TICKER — профиль компании\n"
+        "📋 /компании — все компании\n👥 /держатели TICKER — крупнейшие держатели\n⚙️ /управление_компанией TICKER ... — управление компанией\n🏆 /топденьги — капитал игроков\n\n"
+        "Цена двигается от реальных сделок: покупки создают спрос, продажи — давление предложения.")
 
 
-@bot.message_handler(commands=["bonus"])
+@bot.message_handler(commands=["bonus", "бонус"])
 def handle_exchange_bonus(message: Message) -> None:
-    user_id = message.from_user.id
-    _ex_ensure_trader(user_id)
-    today = date.today().isoformat()
-    conn = _ex_db()
-    row = conn.execute("SELECT balance,last_bonus FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
-    if row["last_bonus"] == today:
-        conn.close()
-        bot.send_message(message.chat.id, "⏳ Ты уже получил ежедневный бонус сегодня. Возвращайся завтра!")
-        return
-    new_balance = float(row["balance"]) + EXCHANGE_DAILY_BONUS
-    conn.execute("UPDATE ex_traders SET balance=?,last_bonus=? WHERE user_id=?", (new_balance, today, user_id))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, f"🎁 <b>Ежедневный бонус!</b>\n\n+{EXCHANGE_DAILY_BONUS:,.0f} ₽\n💰 Баланс: <b>{new_balance:,.2f} ₽</b>")
+    user_id=message.from_user.id; _ex_ensure_trader(user_id); today=date.today().isoformat(); conn=_ex_db()
+    row=conn.execute("SELECT balance,last_bonus FROM ex_traders WHERE user_id=?",(user_id,)).fetchone()
+    if row["last_bonus"]==today:
+        conn.close(); bot.send_message(message.chat.id,"⏳ Ты уже получил ежедневный бонус сегодня. Возвращайся завтра!"); return
+    new_balance=float(row["balance"])+EXCHANGE_DAILY_BONUS
+    conn.execute("UPDATE ex_traders SET balance=?,last_bonus=? WHERE user_id=?",(new_balance,today,user_id)); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"🎁 <b>Ежедневный бонус!</b>\n\n+{EXCHANGE_DAILY_BONUS:,.0f} ₽\n💰 Баланс: <b>{new_balance:,.2f} ₽</b>")
 
 
-@bot.message_handler(commands=["give", "give_money", "выдать"])
-def handle_exchange_admin_give(message: Message) -> None:
-    """Выдать виртуальные деньги из воздуха. Только глобальным админам."""
-    if not _is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "⛔ Эта команда доступна только администраторам.")
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        bot.send_message(message.chat.id, "❓ Формат: <code>/выдать 1000000</code>")
-        return
-    try:
-        amount = float(parts[1].replace(",", "."))
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Сумма должна быть числом.")
-        return
-    if amount <= 0 or amount > 1_000_000_000_000:
-        bot.send_message(message.chat.id, "❌ Сумма должна быть от 1 до 1 000 000 000 000 ₽.")
-        return
-    user_id = message.from_user.id
-    _ex_ensure_trader(user_id)
-    conn = _ex_db()
-    conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?", (amount, user_id))
-    row = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
-    conn.commit()
-    conn.close()
-    bot.send_message(
-        message.chat.id,
-        f"💸 <b>Деньги выданы!</b>\n\n+{amount:,.2f} ₽\n💰 Новый баланс: <b>{float(row['balance']):,.2f} ₽</b>"
-    )
-
-
-@bot.message_handler(commands=["balance"])
+@bot.message_handler(commands=["balance", "баланс"])
 def handle_exchange_balance(message: Message) -> None:
-    row = _ex_ensure_trader(message.from_user.id)
-    bot.send_message(message.chat.id, f"💰 Твой баланс: <b>{float(row['balance']):,.2f} ₽</b>\n\n🎁 Ежедневный бонус: /bonus")
+    row=_ex_ensure_trader(message.from_user.id); bot.send_message(message.chat.id,f"💰 Твой баланс: <b>{float(row['balance']):,.2f} ₽</b>\n\n🎁 Ежедневный бонус: /bonus")
 
 
-@bot.message_handler(commands=["market"])
+@bot.message_handler(commands=["market", "рынок"])
 def handle_exchange_market(message: Message) -> None:
-    try:
-        _ex_require_user(message)
-        _ex_replace_market(message.chat.id, message.from_user.id, 1)
+    try: _ex_require_user(message); _ex_replace_market(message.chat.id,message.from_user.id,1)
     except Exception as exc:
-        logger.exception("/market error: %s", exc)
-        bot.send_message(
-            message.chat.id,
-            "❌ Не удалось открыть рынок.\n\n"
-            f"Техническая ошибка: <code>{html.escape(str(exc))}</code>"
-        )
+        logger.exception("/market error: %s",exc); bot.send_message(message.chat.id,"❌ Не удалось открыть рынок.\n\nТехническая ошибка: <code>"+html.escape(str(exc))+"</code>")
 
 
-@bot.message_handler(commands=["portfolio"])
+@bot.message_handler(commands=["portfolio", "портфель"])
 def handle_exchange_portfolio(message: Message) -> None:
-    user_id = message.from_user.id
-    _ex_ensure_trader(user_id)
-    conn = _ex_db()
-    rows = conn.execute("""
-        SELECT h.shares,h.avg_price,e.name,e.ticker,e.price
-        FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id
-        WHERE h.user_id=? AND h.shares>0 ORDER BY e.ticker
-    """, (user_id,)).fetchall()
-    balance = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()["balance"]
-    conn.close()
-
+    user_id=message.from_user.id; _ex_ensure_trader(user_id); conn=_ex_db()
+    rows=conn.execute("SELECT h.shares,h.avg_price,e.name,e.ticker,e.price FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id WHERE h.user_id=? AND h.shares>0 ORDER BY e.ticker",(user_id,)).fetchall()
+    balance=conn.execute("SELECT balance FROM ex_traders WHERE user_id=?",(user_id,)).fetchone()["balance"]; conn.close()
     if not rows:
-        bot.send_message(message.chat.id, f"💼 <b>Портфель пуст</b>\n\n💰 Баланс: <b>{float(balance):,.2f} ₽</b>\n\nПопробуй /buy BERL 5")
-        return
-
-    lines = [f"💼 <b>Твой портфель</b>\n💰 Баланс: <b>{float(balance):,.2f} ₽</b>\n"]
+        bot.send_message(message.chat.id,f"💼 <b>Портфель пуст</b>\n\n💰 Баланс: <b>{float(balance):,.2f} ₽</b>\n\nПопробуй /buy BERL 5"); return
+    lines=[f"💼 <b>Твой портфель</b>\n💰 Баланс: <b>{float(balance):,.2f} ₽</b>\n"]
     for r in rows:
-        value = r["shares"] * r["price"]
-        pnl = (r["price"] - r["avg_price"]) * r["shares"]
-        lines.append(f"• <b>{r['ticker']}</b> — {r['shares']} шт. × {r['price']:,.2f} ₽ = {value:,.2f} ₽\n  P/L: {pnl:+,.2f} ₽")
-    bot.send_message(message.chat.id, "\n".join(lines))
+        value=r["shares"]*r["price"]; pnl=(r["price"]-r["avg_price"])*r["shares"]
+        lines.append(f"• <b>{r['ticker']}</b> — {r['shares']:,} шт. × {r['price']:,.2f} ₽ = {value:,.2f} ₽\n  P/L: {pnl:+,.2f} ₽")
+    bot.send_message(message.chat.id,"\n".join(lines))
 
 
 def _ex_parse_trade(message):
-    parts = (message.text or "").split()
-    if len(parts) != 3 or not parts[2].isdigit():
-        bot.send_message(message.chat.id, "❓ Формат: <code>/buy BERL 5</code>")
-        return None
-    ticker = parts[1].upper()
-    shares = int(parts[2])
-    if shares <= 0 or shares > EXCHANGE_MAX_TRADE:
-        bot.send_message(message.chat.id, f"❌ Количество должно быть от 1 до {EXCHANGE_MAX_TRADE}.")
-        return None
-    return ticker, shares
+    parts=(message.text or "").split()
+    if len(parts)!=3 or not parts[2].isdigit(): bot.send_message(message.chat.id,"❓ Формат: <code>/buy BERL 5</code>"); return None
+    ticker=parts[1].upper(); shares=int(parts[2])
+    if shares<=0 or shares>EXCHANGE_MAX_TRADE: bot.send_message(message.chat.id,f"❌ Количество должно быть от 1 до {EXCHANGE_MAX_TRADE}."); return None
+    return ticker,shares
 
 
-@bot.message_handler(commands=["buy"])
+@bot.message_handler(commands=["buy", "купить"])
 def handle_exchange_buy(message: Message) -> None:
-    parsed = _ex_parse_trade(message)
-    if not parsed:
-        return
-    ticker, shares = parsed
-    user_id = message.from_user.id
-    _ex_ensure_trader(user_id)
-    conn = _ex_db()
-    ex = conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
-    if not ex:
-        conn.close()
-        bot.send_message(message.chat.id, "❌ Такой акции нет. Посмотри /exchanges")
-        return
-
-    price = float(ex["price"])
-    total = price * shares
-    trader = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
-    if float(trader["balance"]) < total:
-        conn.close()
-        bot.send_message(message.chat.id, f"❌ Недостаточно денег. Нужно <b>{total:,.2f} ₽</b>.")
-        return
-
-    holding = conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"])).fetchone()
-    old_shares = int(holding["shares"]) if holding else 0
-    old_avg = float(holding["avg_price"]) if holding else 0.0
-    new_shares = old_shares + shares
-    new_avg = ((old_shares * old_avg) + total) / new_shares
-
-    conn.execute("UPDATE ex_traders SET balance=balance-? WHERE user_id=?", (total, user_id))
-    conn.execute(
-        "INSERT INTO ex_holdings(user_id,exchange_id,shares,avg_price) VALUES(?,?,?,?) "
-        "ON CONFLICT(user_id,exchange_id) DO UPDATE SET shares=excluded.shares,avg_price=excluded.avg_price",
-        (user_id, ex["id"], new_shares, new_avg),
-    )
-    new_price, change = _ex_change_price(conn, ex["id"], min(0.012, shares / 10000.0))
-    conn.execute(
-        "INSERT INTO ex_transactions(user_id,exchange_id,action,shares,price,total,ts) VALUES(?,?,?,?,?,?,?)",
-        (user_id, ex["id"], "BUY", shares, price, total, datetime.now().isoformat(timespec="seconds")),
-    )
-    conn.commit()
-    conn.close()
-
-    bot.send_message(message.chat.id, f"📈 <b>Покупка исполнена</b>\n\n🪙 {shares} × {ticker}\n💵 Цена сделки: {price:,.2f} ₽\n💸 Сумма: {total:,.2f} ₽\n📊 Новый курс: {new_price:,.2f} ₽ ({change:+.2f}%)")
-    try:
-        _ex_replace_market(message.chat.id, user_id, ex["id"])
-    except Exception as exc:
-        logger.exception("Exchange chart error: %s", exc)
+    parsed=_ex_parse_trade(message)
+    if not parsed: return
+    ticker,shares=parsed; user_id=message.from_user.id; _ex_ensure_trader(user_id); conn=_ex_db()
+    ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Такой акции нет. Посмотри /companies"); return
+    if not ex["active"]: conn.close(); bot.send_message(message.chat.id,"🔴 Эта компания закрыта, новые сделки недоступны."); return
+    available=int(ex["treasury_shares"])
+    if available<shares:
+        conn.close(); bot.send_message(message.chat.id,f"❌ На рынке сейчас только <b>{available:,}</b> свободных акций <code>{ticker}</code>.\nКто-то должен продать свои акции."); return
+    price=float(ex["price"]); total=price*shares
+    trader=conn.execute("SELECT balance FROM ex_traders WHERE user_id=?",(user_id,)).fetchone()
+    if float(trader["balance"])<total: conn.close(); bot.send_message(message.chat.id,f"❌ Недостаточно денег. Нужно <b>{total:,.2f} ₽</b>."); return
+    holding=conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?",(user_id,ex["id"])).fetchone()
+    old_shares=int(holding["shares"]) if holding else 0; old_avg=float(holding["avg_price"]) if holding else 0.0; new_shares=old_shares+shares
+    new_avg=((old_shares*old_avg)+(price*shares))/new_shares
+    impact=_ex_trade_impact(shares,available)
+    conn.execute("UPDATE ex_traders SET balance=balance-? WHERE user_id=?",(total,user_id))
+    conn.execute("INSERT INTO ex_holdings(user_id,exchange_id,shares,avg_price) VALUES(?,?,?,?) ON CONFLICT(user_id,exchange_id) DO UPDATE SET shares=excluded.shares,avg_price=excluded.avg_price",(user_id,ex["id"],new_shares,new_avg))
+    conn.execute("UPDATE ex_exchanges SET treasury_shares=treasury_shares-? WHERE id=?",(shares,ex["id"]))
+    new_price,change=_ex_change_price(conn,ex["id"],impact)
+    conn.execute("INSERT INTO ex_transactions(user_id,exchange_id,action,shares,price,total,ts) VALUES(?,?,?,?,?,?,?)",(user_id,ex["id"],"BUY",shares,price,total,datetime.now().isoformat(timespec="seconds")))
+    conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"📈 <b>Покупка исполнена</b>\n\n🪙 {shares:,} × {ticker}\n💵 Цена сделки: {price:,.2f} ₽\n💸 Сумма: {total:,.2f} ₽\n📊 Новый курс: <b>{new_price:,.2f} ₽</b> ({change:+.2f}%)")
+    try: _ex_replace_market(message.chat.id,user_id,ex["id"])
+    except Exception as exc: logger.exception("Exchange chart error: %s",exc)
 
 
-@bot.message_handler(commands=["sell"])
+@bot.message_handler(commands=["sell", "продать"])
 def handle_exchange_sell(message: Message) -> None:
-    parsed = _ex_parse_trade(message)
-    if not parsed:
-        return
-    ticker, shares = parsed
+    parsed=_ex_parse_trade(message)
+    if not parsed: return
+    ticker,shares=parsed; user_id=message.from_user.id; _ex_ensure_trader(user_id); conn=_ex_db()
+    ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Такой акции нет. Посмотри /companies"); return
+    if not ex["active"]: conn.close(); bot.send_message(message.chat.id,"🔴 Эта компания закрыта, новые сделки недоступны."); return
+    holding=conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?",(user_id,ex["id"])).fetchone()
+    if not holding or int(holding["shares"])<shares: conn.close(); bot.send_message(message.chat.id,"❌ У тебя недостаточно этих акций."); return
+    price=float(ex["price"]); total=price*shares; treasury_before=int(ex["treasury_shares"]); remaining=int(holding["shares"])-shares
+    impact=_ex_trade_impact(shares,max(10_000,treasury_before+shares))
+    conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?",(total,user_id))
+    if remaining: conn.execute("UPDATE ex_holdings SET shares=? WHERE user_id=? AND exchange_id=?",(remaining,user_id,ex["id"]))
+    else: conn.execute("DELETE FROM ex_holdings WHERE user_id=? AND exchange_id=?",(user_id,ex["id"]))
+    conn.execute("UPDATE ex_exchanges SET treasury_shares=treasury_shares+? WHERE id=?",(shares,ex["id"]))
+    new_price,change=_ex_change_price(conn,ex["id"],-impact)
+    conn.execute("INSERT INTO ex_transactions(user_id,exchange_id,action,shares,price,total,ts) VALUES(?,?,?,?,?,?,?)",(user_id,ex["id"],"SELL",shares,price,total,datetime.now().isoformat(timespec="seconds")))
+    conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"📉 <b>Продажа исполнена</b>\n\n🪙 {shares:,} × {ticker}\n💵 Цена сделки: {price:,.2f} ₽\n💰 Получено: {total:,.2f} ₽\n📊 Новый курс: <b>{new_price:,.2f} ₽</b> ({change:+.2f}%)")
+    try: _ex_replace_market(message.chat.id,user_id,ex["id"])
+    except Exception as exc: logger.exception("Exchange chart error: %s",exc)
+
+
+@bot.message_handler(commands=["create_exchange", "создать_компанию"])
+def handle_create_exchange(message: Message) -> None:
+    parts=(message.text or "").split()
+    if len(parts)<3: bot.send_message(message.chat.id,"❓ Формат: <code>/create_exchange MyCompany MYC</code>"); return
+    ticker=parts[-1].upper(); name=" ".join(parts[1:-1]).strip()
+    if not name or not ticker.isalnum() or not 2<=len(ticker)<=8 or not ticker.isascii():
+        bot.send_message(message.chat.id,"❌ Название или тикер указаны неправильно. Тикер: 2–8 латинских символов/цифр."); return
+    conn=_ex_db(); exists=conn.execute("SELECT id FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
+    if exists: conn.close(); bot.send_message(message.chat.id,"❌ Такой тикер уже занят."); return
+    now=datetime.now().isoformat(timespec="seconds")
+    cur=conn.execute("INSERT INTO ex_exchanges(owner_id,name,ticker,price,created_at,total_shares,treasury_shares,description,active) VALUES(?,?,?,?,?,?,?,?,1)",(message.from_user.id,name,ticker,EXCHANGE_DEFAULT_PRICE,now,EXCHANGE_DEFAULT_TOTAL_SHARES,EXCHANGE_FLOAT_SHARES,f"Компания {name}.",))
+    exchange_id=cur.lastrowid
+    conn.execute("INSERT INTO ex_holdings(user_id,exchange_id,shares,avg_price) VALUES(?,?,?,?)",(message.from_user.id,exchange_id,EXCHANGE_OWNER_SHARES,EXCHANGE_DEFAULT_PRICE))
+    conn.execute("INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)",(exchange_id,EXCHANGE_DEFAULT_PRICE,now)); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"🏭 <b>Компания создана!</b>\n\n🏢 {html.escape(name)}\n📈 Тикер: <code>{ticker}</code>\n💰 Стартовая цена: <b>100 ₽</b>\n📦 Всего акций: <b>1 000 000</b>\n👑 Твоя доля: <b>700 000</b>\n🛒 В свободной продаже: <b>300 000</b>\n\nОткрыть профиль: /company {ticker}")
+
+
+@bot.message_handler(commands=["company", "компания"])
+def handle_company(message: Message) -> None:
+    parts=(message.text or "").split(maxsplit=1)
+    if len(parts)<2: bot.send_message(message.chat.id,"❓ Формат: <code>/company BERL</code>"); return
+    conn=_ex_db(); ex=_ex_company_row(conn,parts[1].strip()); conn.close()
+    if not ex: bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    path=_ex_chart(ex["id"])
+    owner=_ex_user_mention(message.chat.id,int(ex["owner_id"]),"Рынок") if int(ex["owner_id"]) else "Berlions"
+    text=(f"🏢 <b>{html.escape(ex['name'])}</b>  <code>${html.escape(ex['ticker'])}</code>\n\n"
+          f"📝 {html.escape(ex['description'] or 'Описание отсутствует.')}\n\n"
+          f"💰 Цена: <b>{float(ex['price']):,.2f} ₽</b>\n📊 Капитализация: <b>{float(ex['price'])*int(ex['total_shares']):,.2f} ₽</b>\n"
+          f"📦 Акций: <b>{int(ex['total_shares']):,}</b>\n🛒 В продаже: <b>{int(ex['treasury_shares']):,}</b>\n👑 Владелец: {owner}\n"
+          f"{'🟢 Торги открыты' if ex['active'] else '🔴 Торги закрыты'}\n\n"
+          f"Покупка: <code>/buy {ex['ticker']} 100</code>\nПродажа: <code>/sell {ex['ticker']} 100</code>\nДержатели: <code>/holders {ex['ticker']}</code>")
+    with open(path,"rb") as photo: bot.send_photo(message.chat.id,photo,caption=text)
+
+
+@bot.message_handler(commands=["companies", "exchanges", "компании"])
+def handle_exchanges(message: Message) -> None:
+    conn=_ex_db(); rows=conn.execute("SELECT * FROM ex_exchanges WHERE active=1 ORDER BY id DESC LIMIT 30").fetchall(); conn.close()
+    if not rows: bot.send_message(message.chat.id,"🏢 Активных компаний пока нет."); return
+    lines=["🏢 <b>Все компании</b>\n"]
+    for r in rows:
+        lines.append(f"• <code>{r['ticker']}</code> — <b>{html.escape(r['name'])}</b> · {float(r['price']):,.2f} ₽\n  Акций в рынке: {int(r['treasury_shares']):,}")
+    lines.append("\nОткрыть компанию: <code>/company TICKER</code>")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(commands=["holders", "держатели"])
+def handle_holders(message: Message) -> None:
+    parts=(message.text or "").split(maxsplit=1)
+    if len(parts)<2: bot.send_message(message.chat.id,"❓ Формат: <code>/holders BERL</code>"); return
+    conn=_ex_db(); ex=_ex_company_row(conn,parts[1].strip())
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    holders=conn.execute("SELECT user_id,shares,avg_price FROM ex_holdings WHERE exchange_id=? AND shares>0 ORDER BY shares DESC LIMIT 10",(ex["id"],)).fetchall(); conn.close()
+    lines=[f"👥 <b>Крупнейшие держатели {html.escape(ex['ticker'])}</b>\n"]
+    for i,h in enumerate(holders,1): lines.append(f"{i}. {_ex_user_mention(message.chat.id,int(h['user_id']))} — <b>{int(h['shares']):,}</b> акций")
+    lines.append(f"\n🛒 Свободно на рынке: <b>{int(ex['treasury_shares']):,}</b>")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(commands=["удалить_компанию"])
+def handle_delete_company(message: Message) -> None:
+    parts=(message.text or "").split(maxsplit=1)
+    if len(parts)<2:
+        bot.send_message(message.chat.id,"❓ Формат: <code>/удалить_компанию TICKER</code>"); return
+    ticker=parts[1].strip().upper(); conn=_ex_db(); ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    if int(ex["owner_id"])!=message.from_user.id and not _is_admin(message.from_user.id):
+        conn.close(); bot.send_message(message.chat.id,"⛔ Удалить компанию может только её владелец или администратор."); return
+    conn.execute("UPDATE ex_exchanges SET active=0 WHERE id=?",(ex["id"],)); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"🗑 Компания <code>{ticker}</code> закрыта и убрана из активного списка. История и акции сохранены.")
+
+
+@bot.message_handler(commands=["company_manage", "управление_компанией"])
+def handle_company_manage(message: Message) -> None:
+    parts=(message.text or "").split(maxsplit=2)
+    if len(parts)<3: bot.send_message(message.chat.id,"⚙️ <b>Управление компанией</b>\n\n<code>/company_manage TICKER описание Новый текст</code>\n<code>/company_manage TICKER close</code>\n<code>/company_manage TICKER issue 100000</code>"); return
+    ticker,action=parts[1].upper(),parts[2].strip(); conn=_ex_db(); ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    if int(ex["owner_id"])!=message.from_user.id: conn.close(); bot.send_message(message.chat.id,"❌ Управлять компанией может только её владелец."); return
+    low=action.lower()
+    if low.startswith("описание "):
+        desc=action.split(" ",1)[1].strip()[:500]; conn.execute("UPDATE ex_exchanges SET description=? WHERE id=?",(desc,ex["id"])); conn.commit(); conn.close(); bot.send_message(message.chat.id,"✅ Описание компании обновлено."); return
+    if low=="close":
+        conn.execute("UPDATE ex_exchanges SET active=0 WHERE id=?",(ex["id"],)); conn.commit(); conn.close(); bot.send_message(message.chat.id,f"🔴 Компания <code>{ticker}</code> закрыта. История и акции сохранены, новые сделки недоступны."); return
+    if low.startswith("issue ") and low.split(" ",1)[1].isdigit():
+        amount=int(low.split(" ",1)[1])
+        if amount<=0 or amount>10_000_000: conn.close(); bot.send_message(message.chat.id,"❌ Выпуск: от 1 до 10 000 000 акций."); return
+        conn.execute("UPDATE ex_exchanges SET total_shares=total_shares+?,treasury_shares=treasury_shares+? WHERE id=?",(amount,amount,ex["id"])); conn.commit(); conn.close(); bot.send_message(message.chat.id,f"📦 Выпущено <b>{amount:,}</b> новых акций <code>{ticker}</code>. Они добавлены в свободный рынок."); return
+    conn.close(); bot.send_message(message.chat.id,"❓ Неизвестная команда управления. Используй: описание / close / issue." )
+
+
+@bot.message_handler(commands=["topmoney", "toptraders", "топденьги", "топтрейдеров"])
+def handle_exchange_top(message: Message) -> None:
+    conn=_ex_db(); traders=conn.execute("""
+        SELECT t.user_id,t.balance FROM ex_traders t
+        WHERE EXISTS (SELECT 1 FROM social_users su WHERE su.chat_id=? AND su.user_id=t.user_id)
+    """, (message.chat.id,)).fetchall(); result=[]
+    for trader in traders:
+        holdings=conn.execute("SELECT h.shares,e.price FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id WHERE h.user_id=?",(trader["user_id"],)).fetchall()
+        total=float(trader["balance"])+sum(int(h["shares"])*float(h["price"]) for h in holdings); result.append((total,int(trader["user_id"])))
+    conn.close(); result.sort(reverse=True); lines=["🏆 <b>TOP TRADERS</b>\n"]
+    for i,(total,uid) in enumerate(result[:20],1): lines.append(f"{i}. {_ex_user_mention(message.chat.id,uid)} — <b>{total:,.2f} ₽</b>")
+    bot.send_message(message.chat.id,"\n".join(lines) if len(lines)>1 else "🏆 Пока рейтинг пуст.")
+
+
+@bot.message_handler(commands=["работа", "work"])
+def handle_exchange_work(message: Message) -> None:
     user_id = message.from_user.id
     _ex_ensure_trader(user_id)
     conn = _ex_db()
-    ex = conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
-    if not ex:
-        conn.close()
-        bot.send_message(message.chat.id, "❌ Такой акции нет. Посмотри /exchanges")
-        return
-
-    holding = conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"])).fetchone()
-    if not holding or int(holding["shares"]) < shares:
-        conn.close()
-        bot.send_message(message.chat.id, "❌ У тебя недостаточно этих акций.")
-        return
-
-    price = float(ex["price"])
-    total = price * shares
-    remaining = int(holding["shares"]) - shares
-    conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?", (total, user_id))
-    if remaining:
-        conn.execute("UPDATE ex_holdings SET shares=? WHERE user_id=? AND exchange_id=?", (remaining, user_id, ex["id"]))
-    else:
-        conn.execute("DELETE FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"]))
-
-    new_price, change = _ex_change_price(conn, ex["id"], -min(0.012, shares / 10000.0))
-    conn.execute(
-        "INSERT INTO ex_transactions(user_id,exchange_id,action,shares,price,total,ts) VALUES(?,?,?,?,?,?,?)",
-        (user_id, ex["id"], "SELL", shares, price, total, datetime.now().isoformat(timespec="seconds")),
-    )
-    conn.commit()
-    conn.close()
-
-    bot.send_message(message.chat.id, f"📉 <b>Продажа исполнена</b>\n\n🪙 {shares} × {ticker}\n💵 Цена сделки: {price:,.2f} ₽\n💰 Получено: {total:,.2f} ₽\n📊 Новый курс: {new_price:,.2f} ₽ ({change:+.2f}%)")
-    try:
-        _ex_replace_market(message.chat.id, user_id, ex["id"])
-    except Exception as exc:
-        logger.exception("Exchange chart error: %s", exc)
-
-
-@bot.message_handler(commands=["create_exchange"])
-def handle_create_exchange(message: Message) -> None:
-    parts = (message.text or "").split()
-    if len(parts) < 3:
-        bot.send_message(message.chat.id, "❓ Формат: <code>/create_exchange MyCompany MYC</code>")
-        return
-    ticker = parts[-1].upper()
-    name = " ".join(parts[1:-1]).strip()
-    if not name or not ticker.isalnum() or not 2 <= len(ticker) <= 8:
-        bot.send_message(message.chat.id, "❌ Название или тикер указаны неправильно. Тикер: 2–8 латинских символов/цифр.")
-        return
-
-    conn = _ex_db()
-    exists = conn.execute("SELECT id FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
-    if exists:
-        conn.close()
-        bot.send_message(message.chat.id, "❌ Такой тикер уже занят.")
-        return
-    cur = conn.execute(
-        "INSERT INTO ex_exchanges(owner_id,name,ticker,price,created_at) VALUES(?,?,?,?,?)",
-        (message.from_user.id, name, ticker, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
-    )
-    exchange_id = cur.lastrowid
-    conn.execute("INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)", (exchange_id, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, f"🏭 <b>Биржа создана!</b>\n\n🏦 {html.escape(name)}\n📈 Тикер: <code>{ticker}</code>\n💰 Стартовая цена: <b>100 ₽</b>\n\nТеперь игроки могут покупать и продавать <code>{ticker}</code> через /buy и /sell.")
-
-
-@bot.message_handler(commands=["exchanges"])
-def handle_exchanges(message: Message) -> None:
-    conn = _ex_db()
-    rows = conn.execute("SELECT * FROM ex_exchanges ORDER BY id DESC LIMIT 30").fetchall()
-    conn.close()
-    lines = ["🏦 <b>Все биржи</b>\n"]
-    for r in rows:
-        lines.append(f"• <code>{r['ticker']}</code> — {html.escape(r['name'])}: <b>{r['price']:,.2f} ₽</b>\n  Владелец: {_mention_user(message.chat.id, int(r['owner_id']))}")
-    bot.send_message(message.chat.id, "\n".join(lines))
-
-
-@bot.message_handler(commands=["topmoney", "toptraders"])
-def handle_exchange_top(message: Message) -> None:
-    conn = _ex_db()
-    traders = conn.execute("SELECT user_id,balance FROM ex_traders").fetchall()
-    result = []
-    for trader in traders:
-        holdings = conn.execute(
-            "SELECT h.shares,e.price FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id WHERE h.user_id=?",
-            (trader["user_id"],),
-        ).fetchall()
-        total = float(trader["balance"]) + sum(int(h["shares"]) * float(h["price"]) for h in holdings)
-        result.append((total, trader["user_id"]))
-    conn.close()
-    result.sort(reverse=True)
-    lines = ["🏆 <b>TOP TRADERS</b>\n"]
-    for i, (total, uid) in enumerate(result[:20], 1):
-        lines.append(f"{i}. {_mention_user(message.chat.id, uid)} — <b>{total:,.2f} ₽</b>")
-    bot.send_message(message.chat.id, "\n".join(lines) if len(lines) > 1 else "🏆 Пока рейтинг пуст.")
-
-
-# ВАЖНО: этот callback зарегистрирован ДО старого общего callback-хендлера.
-@bot.callback_query_handler(func=lambda call: call.data.startswith("ex_"))
-def handle_exchange_callback(call: CallbackQuery) -> None:
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id if call.message else user_id
-    try:
-        if call.data == "ex_refresh":
-            bot.answer_callback_query(call.id, "🔄 Обновляю рынок...")
-            _ex_replace_market(chat_id, user_id, 1)
-        elif call.data == "ex_portfolio":
-            bot.answer_callback_query(call.id)
-            handle_exchange_portfolio(call.message)
-        elif call.data == "ex_bonus":
-            bot.answer_callback_query(call.id)
-            handle_exchange_bonus(call.message)
-    except Exception as exc:
-        logger.exception("Exchange callback error: %s", exc)
+    row = conn.execute("SELECT balance,last_work FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
+    now = datetime.now()
+    if row["last_work"]:
         try:
-            bot.answer_callback_query(call.id, "❌ Ошибка биржи", show_alert=True)
+            elapsed = (now - datetime.fromisoformat(row["last_work"])).total_seconds()
+            if elapsed < 1800:
+                mins = max(1, int((1800-elapsed + 59)//60))
+                conn.close()
+                bot.send_message(message.chat.id, f"⏳ Ты уже работал. Следующая смена через <b>{mins} мин.</b>")
+                return
         except Exception:
             pass
+    reward = random.randint(500, 3000)
+    new_balance = float(row["balance"]) + reward
+    conn.execute("UPDATE ex_traders SET balance=?,last_work=? WHERE user_id=?", (new_balance, now.isoformat(timespec="seconds"), user_id))
+    conn.commit(); conn.close()
+    jobs = ["отработал смену", "выполнил заказ", "подзаработал", "закрыл рабочий день"]
+    bot.send_message(message.chat.id, f"💼 <b>{random.choice(jobs).capitalize()}!</b>\n\n💰 Получено: <b>+{reward:,} ₽</b>\n💳 Баланс: <b>{new_balance:,.2f} ₽</b>\n\n⏱ Следующая работа — через 30 минут.")
+
+
+def _money_target(message: Message, arg: str = "") -> int | None:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+    target = _social_target(message, arg) if "_social_target" in globals() else None
+    if target:
+        return target
+    token = (arg or "").split()[0] if (arg or "").split() else ""
+    if token.startswith("@"):
+        try:
+            member = bot.get_chat_member(message.chat.id, token)
+            return member.user.id
+        except Exception:
+            return None
+    return None
+
+
+@bot.message_handler(commands=["забрать"])
+def handle_admin_take_money(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ Только администратор может использовать эту команду.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+        amount_raw = parts[1] if len(parts) > 1 else ""
+    else:
+        target = _social_target(message, parts[1]) if len(parts) > 1 and "_social_target" in globals() else None
+        amount_raw = parts[2] if len(parts) > 2 else ""
+    if not target or not amount_raw.isdigit():
+        bot.send_message(message.chat.id, "❓ Формат: <code>/забрать @user 1000</code> или ответом: <code>/забрать 1000</code>")
+        return
+    amount = int(amount_raw)
+    if amount <= 0:
+        bot.send_message(message.chat.id, "❌ Сумма должна быть больше нуля.")
+        return
+    _ex_ensure_trader(target)
+    conn = _ex_db()
+    row = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (target,)).fetchone()
+    old = float(row["balance"])
+    taken = min(old, float(amount))
+    new = old - taken
+    conn.execute("UPDATE ex_traders SET balance=? WHERE user_id=?", (new, target))
+    conn.commit(); conn.close()
+    bot.send_message(message.chat.id, f"💸 У {_ex_user_mention(message.chat.id,target)} забрано <b>{taken:,.2f} ₽</b>.\n💰 Новый баланс: <b>{new:,.2f} ₽</b>")
+
+
+@bot.message_handler(commands=["выдать"])
+def handle_admin_give_money(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ Только администратор может использовать эту команду.")
+        return
+    parts=(message.text or "").split()
+    if len(parts)!=2 or not parts[1].isdigit() or int(parts[1])<=0:
+        bot.send_message(message.chat.id, "❓ Формат: <code>/выдать 100000</code>")
+        return
+    amount=int(parts[1]); uid=message.from_user.id; _ex_ensure_trader(uid)
+    conn=_ex_db(); row=conn.execute("SELECT balance FROM ex_traders WHERE user_id=?",(uid,)).fetchone(); new=float(row["balance"])+amount
+    conn.execute("UPDATE ex_traders SET balance=? WHERE user_id=?",(new,uid)); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"💰 Тебе выдано <b>+{amount:,} ₽</b>.\nБаланс: <b>{new:,.2f} ₽</b>")
+
+
+# Этот callback расположен ДО общего callback-хендлера ниже.
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("ex_")))
+def handle_exchange_callback(call: CallbackQuery) -> None:
+    user_id=call.from_user.id; chat_id=call.message.chat.id if call.message else user_id
+    try:
+        bot.answer_callback_query(call.id)
+        if call.data=="ex_refresh": _ex_replace_market(chat_id,user_id,1)
+        elif call.data=="ex_portfolio": handle_exchange_portfolio(call.message)
+        elif call.data=="ex_bonus": handle_exchange_bonus(call.message)
+    except Exception as exc:
+        logger.exception("Exchange callback error: %s",exc)
+        try: bot.answer_callback_query(call.id,"❌ Ошибка биржи",show_alert=True)
+        except Exception: pass
 
 # ── END BERLIONS EXCHANGE SYSTEM ───────────────────────────────────────────────
 
 
 # ── Dice game logic ───────────────────────────────────────────────────────────
 
-@bot.message_handler(commands=["dice"])
+@bot.message_handler(commands=["dice", "кости"])
 def handle_dice_command(message: Message) -> None:
     user_id = message.from_user.id
     now = time.time()
@@ -1099,117 +1074,56 @@ def _play_dice(chat_id: int, user_id: int) -> None:
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("marry_")))
 def handle_marriage_callback_direct(call: CallbackQuery) -> None:
-    """Обработчик кнопок брака. Сначала сразу закрываем 'часики' Telegram."""
+    """Быстрый callback брака: Telegram получает ответ до любой БД-операции."""
     logger.info("Marriage button pressed: data=%r user=%s", call.data, call.from_user.id)
-
-    # Telegram показывает загрузку на кнопке, пока бот не ответит на callback.
-    # Отвечаем СРАЗУ, ещё до работы с SQLite и редактирования сообщения.
     try:
         bot.answer_callback_query(call.id)
     except Exception:
         logger.exception("Failed to acknowledge marriage callback")
-
     try:
-        action, pid_raw = call.data.split(":", 1)
-        pid = int(pid_raw)
-
+        action, raw_id = call.data.split(":", 1)
+        proposal_id = int(raw_id)
         conn = _social_db()
-        proposal = conn.execute(
-            "SELECT * FROM social_marriage_proposals WHERE id=?",
-            (pid,),
-        ).fetchone()
-
+        proposal = conn.execute("SELECT * FROM social_marriage_proposals WHERE id=?", (proposal_id,)).fetchone()
         if not proposal or proposal["status"] != "pending":
             conn.close()
-            try:
-                bot.answer_callback_query(call.id, "Предложение уже обработано.", show_alert=True)
-            except Exception:
-                pass
+            try: bot.answer_callback_query(call.id, "Предложение уже обработано.", show_alert=True)
+            except Exception: pass
             return
-
-        if call.from_user.id != proposal["to_user"]:
+        if int(call.from_user.id) != int(proposal["to_user"]):
             conn.close()
-            try:
-                bot.answer_callback_query(call.id, "Это предложение не для тебя.", show_alert=True)
-            except Exception:
-                pass
+            try: bot.answer_callback_query(call.id, "Это предложение не для тебя.", show_alert=True)
+            except Exception: pass
             return
-
         if action == "marry_no":
-            conn.execute(
-                "UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",
-                (pid,),
-            )
-            conn.commit()
-            conn.close()
-
-            bot.edit_message_text(
-                "❌ <b>Предложение отклонено.</b>",
-                call.message.chat.id,
-                call.message.message_id,
-            )
+            conn.execute("UPDATE social_marriage_proposals SET status='rejected' WHERE id=?", (proposal_id,))
+            conn.commit(); conn.close()
+            bot.edit_message_text("❌ <b>Предложение отклонено.</b>", call.message.chat.id, call.message.message_id)
             return
-
         if action != "marry_yes":
-            conn.close()
+            conn.close(); return
+        if (_social_active_marriage(conn, proposal["chat_id"], proposal["from_user"]) or
+            _social_active_marriage(conn, proposal["chat_id"], proposal["to_user"])):
+            conn.execute("UPDATE social_marriage_proposals SET status='rejected' WHERE id=?", (proposal_id,))
+            conn.commit(); conn.close()
+            try: bot.answer_callback_query(call.id, "У одного из вас уже есть активный брак.", show_alert=True)
+            except Exception: pass
             return
-
-        if (
-            _social_active_marriage(conn, proposal["chat_id"], proposal["from_user"])
-            or _social_active_marriage(conn, proposal["chat_id"], proposal["to_user"])
-        ):
-            conn.execute(
-                "UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",
-                (pid,),
-            )
-            conn.commit()
-            conn.close()
-            try:
-                bot.answer_callback_query(
-                    call.id,
-                    "У одного из вас уже есть активный брак.",
-                    show_alert=True,
-                )
-            except Exception:
-                pass
-            return
-
         now = _social_now().isoformat(sep=" ")
-        conn.execute(
-            "UPDATE social_marriage_proposals SET status='accepted' WHERE id=?",
-            (pid,),
-        )
-        conn.execute(
-            "INSERT INTO social_marriages(chat_id,user1,user2,created_at,active) VALUES(?,?,?,?,1)",
-            (
-                proposal["chat_id"],
-                proposal["from_user"],
-                proposal["to_user"],
-                now,
-            ),
-        )
-        conn.commit()
-        conn.close()
-
+        conn.execute("UPDATE social_marriage_proposals SET status='accepted' WHERE id=?", (proposal_id,))
+        conn.execute("INSERT INTO social_marriages(chat_id,user1,user2,created_at,active) VALUES(?,?,?,?,1)",
+                     (proposal["chat_id"], proposal["from_user"], proposal["to_user"], now))
+        conn.commit(); conn.close()
         bot.edit_message_text(
-            f"💍 <b>Брак заключён!</b>\\n\\n"
+            f"💍 <b>Брак заключён!</b>\n\n"
             f"{_social_user_label(proposal['chat_id'], proposal['from_user'])} ❤️ "
-            f"{_social_user_label(proposal['chat_id'], proposal['to_user'])}\\n"
+            f"{_social_user_label(proposal['chat_id'], proposal['to_user'])}\n"
             f"🌱 Стаж: <b>0 дней</b> — 💚 Зелёные",
-            call.message.chat.id,
-            call.message.message_id,
-        )
-
+            call.message.chat.id, call.message.message_id)
     except Exception:
         logger.exception("Marriage button error")
-        try:
-            bot.answer_callback_query(
-                call.id,
-                "❌ Не удалось обработать кнопку. Попробуй ещё раз.",
-                show_alert=True,
-            )
-        except Exception:
-            pass
+        try: bot.answer_callback_query(call.id, "❌ Не удалось обработать кнопку.", show_alert=True)
+        except Exception: pass
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1266,7 +1180,7 @@ def handle_callback(call: CallbackQuery) -> None:
   
 # ── /stop — завершение сбора файлов для админов ───────────────────────────────
 
-@bot.message_handler(commands=["stop"])
+@bot.message_handler(commands=["stop", "стоп"])
 def handle_stop(message: Message) -> None:
     if not _is_admin(message.from_user.id): return
     state = _pending.get(message.from_user.id)
@@ -1308,7 +1222,7 @@ def handle_stop(message: Message) -> None:
 
 # ── Admin: /add ───────────────────────────────────────────────────────────────
 
-@bot.message_handler(commands=["add"])
+@bot.message_handler(commands=["add", "добавить"])
 def handle_add(message: Message) -> None:
     if not _is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "⛔ У тебя нет доступа к этой команде.")
@@ -1318,7 +1232,7 @@ def handle_add(message: Message) -> None:
 
 # ── Admin: /list ──────────────────────────────────────────────────────────────
 
-@bot.message_handler(commands=["list"])
+@bot.message_handler(commands=["list", "список"])
 def handle_list(message: Message) -> None:
     if not _is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "⛔ У тебя нет доступа к этой команде.")
@@ -1337,7 +1251,7 @@ def handle_list(message: Message) -> None:
 
 # ── Admin: /delete ────────────────────────────────────────────────────────────
 
-@bot.message_handler(commands=["delete"])
+@bot.message_handler(commands=["delete", "удалить"])
 def handle_delete(message: Message) -> None:
     if not _is_admin(message.from_user.id): return
     parts = message.text.strip().split(maxsplit=1)
@@ -1355,7 +1269,7 @@ def handle_delete(message: Message) -> None:
 
 # ── Admin: /edit ──────────────────────────────────────────────────────────────
 
-@bot.message_handler(commands=["edit"])
+@bot.message_handler(commands=["edit", "изменить"])
 def handle_edit(message: Message) -> None:
     if not _is_admin(message.from_user.id): return
     parts = message.text.strip().split(maxsplit=1)
@@ -1454,141 +1368,6 @@ def handle_conversation(message: Message) -> None:
             except Exception as exc: bot.send_message(message.chat.id, f"❌ Ошибка: {exc}")
         else: bot.send_message(message.chat.id, "⚠️ Отправь файл, ссылку, <code>-</code> чтобы оставить текущее, или /stop чтобы сохранить уже добавленные файлы.")
 
-# ── Chat Admin System (Iris-like) - ПЛЕЙСХОЛДЕРЫ ───────────────────────────────
-# Эти функции требуют соответствующей реализации в database.py для работы с рангами.
-
-RANK_NAMES = {1: "Младший модератор", 2: "Модератор", 3: "Старший модератор", 4: "Администратор", 5: "Создатель"}
-
-# Функция _get_user_rank в текущем виде не взаимодействует с реальной БД для рангов.
-# Она использует `hasattr(database, "get_chat_admins")` как проверку, но `database.py`
-# не содержит этих функций. Это плейсхолдер.
-def _get_user_rank(chat_id: int, user_id: int) -> int:
-    """Возвращает ранг пользователя в чате. 0, если не админ."""
-    # ВНИМАНИЕ: Эта часть требует, чтобы 'database.py' имел функции для управления админами чата.
-    # Если их нет, эта функция всегда будет возвращать 0.
-    if hasattr(database, "get_chat_admins"):
-        try:
-            admins = database.get_chat_admins(chat_id)
-            for row in admins:
-                if isinstance(row, (list, tuple)):
-                    uid, rank = row[0], row[1]
-                else:
-                    uid, rank = row["user_id"], row["rank"]
-                if int(uid) == int(user_id):
-                    return int(rank)
-        except Exception as e:
-            logger.debug(f"Ошибка при получении ранга из БД: {e}")
-    return 0
-
-def _can_manage(chat_id: int, actor_id: int, target_id: int, required_rank: int) -> bool:
-    """Проверяет, может ли actor_id управлять target_id."""
-    if _is_admin(actor_id): return True # Глобальный админ может всё
-    if _is_admin(target_id): return False # Нельзя управлять глобальным админом
-    actor_rank = _get_user_rank(chat_id, actor_id)
-    target_rank = _get_user_rank(chat_id, target_id)
-    return actor_rank >= required_rank and actor_rank > target_rank
-
-def _parse_target(message: Message) -> int | None:
-    """Извлекает ID целевого пользователя из ответа или текста сообщения."""
-    if message.reply_to_message: return message.reply_to_message.from_user.id
-    parts = (message.text or "").split()
-    if len(parts) > 1 and parts[1].isdigit(): return int(parts[1])
-    return None
-
-@bot.message_handler(commands=["rank", "ranks"])
-def handle_rank(message: Message) -> None:
-    if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 3:
-        bot.send_message(message.chat.id, "⛔ Недостаточно прав.")
-        return
-    chat_id = message.chat.id
-    admins = [] # Здесь должен быть вызов database.get_chat_admins(chat_id)
-    if not hasattr(database, "get_chat_admins"):
-        bot.send_message(chat_id, "⚠️ Система рангов не настроена в database.py.")
-        return
-    
-    try:
-        admins = database.get_chat_admins(chat_id)
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ Ошибка получения админов: {e}")
-        return
-
-    if not admins:
-        bot.send_message(chat_id, "📋 В этом чате нет назначенных админов.")
-        return
-    lines = ["<b>👮 Админы чата:</b>\n"]
-    for row in admins:
-        if isinstance(row, (list, tuple)):
-            uid, rank = row[0], row[1]
-        else:
-            uid, rank = row["user_id"], row["rank"]
-        lines.append(f"• {_mention_user(chat_id, int(uid))} — {RANK_NAMES.get(rank, f'Ранг {rank}')}")
-    bot.send_message(chat_id, "\n".join(lines))
-
-@bot.message_handler(commands=["setrank"])
-def handle_setrank(message: Message) -> None:
-    if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 4:
-        bot.send_message(message.chat.id, "⛔ Только от 4 ранга или глобальный админ.")
-        return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ /setrank ID или ответь на сообщение"); return
-    parts = message.text.strip().split()
-    if len(parts) < 3 or not parts[2].isdigit(): bot.send_message(message.chat.id, "❓ /setrank <ID> <1-5>"); return
-    new_rank = int(parts[2])
-    if not 1 <= new_rank <= 5: bot.send_message(message.chat.id, "❌ Ранг от 1 до 5."); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 4): bot.send_message(message.chat.id, "⛔ Недостаточно прав."); return
-    # Здесь должен быть вызов database.set_admin_rank
-    if hasattr(database, "set_admin_rank"):
-        database.set_admin_rank(message.chat.id, target_id, new_rank)
-        bot.send_message(message.chat.id, f"✅ Пользователь {target_id} получил ранг {new_rank} — {RANK_NAMES.get(new_rank)}")
-    else:
-        bot.send_message(message.chat.id, "⚠️ Функция set_admin_rank не найдена в database.py.")
-
-@bot.message_handler(commands=["demote"])
-def handle_demote(message: Message) -> None:
-    if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 4:
-        bot.send_message(message.chat.id, "⛔ Недостаточно прав.")
-        return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ Ответь на сообщение."); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 4): bot.send_message(message.chat.id, "⛔ Не можешь понизить."); return
-    # Здесь должен быть вызов database.remove_admin
-    if hasattr(database, "remove_admin"):
-        database.remove_admin(message.chat.id, target_id)
-        bot.send_message(message.chat.id, f"✅ Пользователь {target_id} разжалован.")
-    else:
-        bot.send_message(message.chat.id, "⚠️ Функция remove_admin не найдена в database.py.")
-
-
-@bot.message_handler(commands=["kick"])
-def handle_kick(message: Message) -> None:
-    if _get_user_rank(message.chat.id, message.from_user.id) < 2: bot.send_message(message.chat.id, "⛔ Требуется минимум 2 ранг."); return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ /kick (ответ)"); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 2): bot.send_message(message.chat.id, "⛔ Недостаточно прав."); return
-    try:
-        bot.kick_chat_member(message.chat.id, target_id)
-        bot.unban_chat_member(message.chat.id, target_id)
-        bot.send_message(message.chat.id, f"👢 Пользователь {target_id} кикнут.")
-    except Exception as e: bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=["warn"])
-def handle_warn(message: Message) -> None:
-    if _get_user_rank(message.chat.id, message.from_user.id) < 2: bot.send_message(message.chat.id, "⛔ Требуется минимум 2 ранг."); return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ /warn (ответ) [причина]"); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 2): bot.send_message(message.chat.id, "⛔ Недостаточно прав."); return
-    reason = " ".join(message.text.split()[2:]) if len(message.text.split()) > 2 else "Без причины"
-    # Здесь должен быть вызов database.add_warning
-    if hasattr(database, "add_warning"):
-        database.add_warning(message.chat.id, target_id, message.from_user.id, reason)
-        warnings = len(database.get_user_warnings(message.chat.id, target_id)) # Здесь должен быть вызов database.get_user_warnings
-        bot.send_message(message.chat.id, f"⚠️ Предупреждение {target_id} ({warnings}/3)\nПричина: {reason}")
-        if warnings >= 3:
-            try: bot.ban_chat_member(message.chat.id, target_id); bot.send_message(message.chat.id, "🚫 Автобан после 3 варнов.")
-            except: pass
-    else: bot.send_message(message.chat.id, "⚠️ Функции предупреждений не найдены в database.py.")
-
-
 # ── BERLIONS SOCIAL SYSTEM ────────────────────────────────────────────────────
 # Профили, активность, награды, браки, кланы и безопасные ролевые команды.
 
@@ -1676,6 +1455,14 @@ def _social_init_db():
         user_id INTEGER NOT NULL,
         joined_at TEXT NOT NULL,
         PRIMARY KEY(chat_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS social_clan_bans (
+        chat_id INTEGER NOT NULL,
+        clan_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        banned_at TEXT NOT NULL,
+        PRIMARY KEY(chat_id, clan_id, user_id)
     );
     """)
     conn.commit()
@@ -1963,24 +1750,81 @@ def _social_active_marriage(conn, chat_id: int, user_id: int):
 def handle_social_profile(message: Message) -> None:
     args = " ".join((message.text or "").split()[1:])
     target = _social_target(message, args) or message.from_user.id
+    # Регистрируем автора запроса сразу, чтобы первое появление сохранялось.
+    try: _social_register(message)
+    except Exception: pass
     conn = _social_db()
-    row = conn.execute("SELECT first_name,username FROM social_users WHERE chat_id=? AND user_id=?", (message.chat.id,target)).fetchone()
+    row = conn.execute("SELECT * FROM social_users WHERE chat_id=? AND user_id=?", (message.chat.id,target)).fetchone()
+    if not row:
+        try:
+            member=bot.get_chat_member(message.chat.id,target); u=member.user
+            now=_social_now().isoformat(sep=" ")
+            conn.execute("INSERT OR IGNORE INTO social_users(chat_id,user_id,username,first_name,last_name,first_seen,last_seen) VALUES(?,?,?,?,?,?,?)",
+                         (message.chat.id,target,u.username,u.first_name or "",u.last_name or "",now,now)); conn.commit()
+            row=conn.execute("SELECT * FROM social_users WHERE chat_id=? AND user_id=?",(message.chat.id,target)).fetchone()
+        except Exception: pass
+    day=_social_activity_for_user(message.chat.id,target,"day")
+    week=_social_activity_for_user(message.chat.id,target,"week")
+    month=_social_activity_for_user(message.chat.id,target,"month")
+    label=_social_user_label(message.chat.id,target)
+    display=("@"+row["username"]) if row and row["username"] else ((row["first_name"] if row else None) or "Пользователь")
+
+    conn=_social_db()
+    awards=conn.execute("SELECT reason,created_at,from_user FROM social_awards WHERE chat_id=? AND to_user=? ORDER BY id DESC LIMIT 10",(message.chat.id,target)).fetchall()
+    marriage=conn.execute("""SELECT * FROM social_marriages WHERE chat_id=? AND active=1 AND (user1=? OR user2=?) LIMIT 1""",(message.chat.id,target,target)).fetchone()
+    clan=conn.execute("""SELECT c.id,c.name,c.owner_id,m.joined_at FROM social_clan_members m JOIN social_clans c ON c.id=m.clan_id WHERE m.chat_id=? AND m.user_id=? LIMIT 1""",(message.chat.id,target)).fetchone()
     conn.close()
-    day = _social_activity_for_user(message.chat.id,target,"day")
-    week = _social_activity_for_user(message.chat.id,target,"week")
-    month = _social_activity_for_user(message.chat.id,target,"month")
-    total = _social_activity_for_user(message.chat.id,target,"all")
-    name = row["username"] if row and row["username"] else (row["first_name"] if row else "Пользователь")
-    display_name = ("@" + name) if row and row["username"] else name
-    mention = _mention_user(message.chat.id, target, display_name)
-    path=os.path.join(SOCIAL_GRAPH_DIR,f"profile_{message.chat.id}_{target}.png")
-    _social_profile_png(path,display_name,day,week,month,total)
-    caption=(f"👤 <b>Профиль {mention}</b>\n\n"
-             f"💬 Сегодня: <b>{day}</b> сообщений\n"
-             f"📅 За неделю: <b>{week}</b>\n"
-             f"🗓 За месяц: <b>{month}</b>\n"
-             f"📊 Всего: <b>{total}</b>")
-    with open(path,"rb") as photo: bot.send_photo(message.chat.id,photo,caption=caption)
+
+    def duration_from(start):
+        try:
+            d=max(0,(_social_now()-datetime.fromisoformat(start)).days)
+            if d < 30: return f"{d} дн."
+            months=d//30; days=d%30
+            return f"{months} мес." + (f" {days} дн." if days else "")
+        except Exception: return "неизвестно"
+
+    first_seen=duration_from(row["first_seen"]) if row else "неизвестно"
+    spouse=None; marriage_duration=None
+    if marriage:
+        spouse_id=int(marriage["user2"] if int(marriage["user1"])==target else marriage["user1"])
+        spouse=_social_user_label(message.chat.id,spouse_id)
+        marriage_duration=_social_duration_text(marriage["created_at"])
+
+    lines=[f"👤 <b>Это пользователь {label}</b>","",
+           "💚 <b>Состоит в чате</b>",
+           f"📅 В чате: <b>{first_seen}</b>",
+           "",
+           f"💬 <b>Активность:</b> {day} дн. / {week} нед. / {month} мес."]
+    if clan:
+        owner_mark=" 👑" if int(clan["owner_id"])==target else ""
+        lines += [f"🏰 Клан: <b>{html.escape(clan['name'])}</b>{owner_mark}"]
+    else:
+        lines += ["🏰 Клан: <b>нет</b>"]
+    if spouse:
+        lines += [f"💍 Брак: {spouse} · <b>{marriage_duration}</b>"]
+    else:
+        lines += ["💍 Брак: <b>нет</b>"]
+    lines.append("")
+    lines.append("🏆 <b>НАГРАДЫ</b>")
+    if awards:
+        for a in awards:
+            lines.append(f"🎗 {html.escape(a['reason'])} · <b>{duration_from(a['created_at'])}</b>")
+    else:
+        lines.append("— пока нет")
+    caption="\n".join(lines)
+
+    # Настоящая аватарка Telegram вместо нарисованной карточки.
+    try:
+        photos=bot.get_user_profile_photos(target,limit=1)
+        if photos and photos.total_count and photos.photos and photos.photos[0]:
+            file_id=photos.photos[0][-1].file_id
+            file_info=bot.get_file(file_id)
+            data=bot.download_file(file_info.file_path)
+            bot.send_photo(message.chat.id, io.BytesIO(data), caption=caption)
+            return
+    except Exception:
+        logger.exception("Profile avatar load error")
+    bot.send_message(message.chat.id,caption)
 
 
 @bot.message_handler(commands=["awards", "награды"])
@@ -2024,18 +1868,17 @@ def handle_social_marriages(message: Message) -> None:
 @bot.message_handler(commands=["clans", "кланы"])
 def handle_social_clans(message: Message) -> None:
     conn=_social_db()
-    rows=conn.execute("""
-        SELECT c.name,c.owner_id,COUNT(m.user_id) members
-        FROM social_clans c LEFT JOIN social_clan_members m ON m.clan_id=c.id
-        WHERE c.chat_id=? GROUP BY c.id ORDER BY members DESC,c.name LIMIT 20
-    """,(message.chat.id,)).fetchall()
-    conn.close()
+    rows=conn.execute("""SELECT c.id,c.name,c.owner_id,COUNT(m.user_id) members FROM social_clans c LEFT JOIN social_clan_members m ON m.clan_id=c.id WHERE c.chat_id=? GROUP BY c.id ORDER BY members DESC,c.name LIMIT 20""",(message.chat.id,)).fetchall()
     if not rows:
-        bot.send_message(message.chat.id,"🏰 Кланов пока нет. Создай первый: <code>создать клан название</code>")
-        return
+        conn.close(); bot.send_message(message.chat.id,"🏰 Кланов пока нет. Создай первый: <code>создать клан название</code>"); return
     lines=["🏰 <b>Кланы Berlions</b>\n"]
-    for i,r in enumerate(rows,1): lines.append(f"{i}. <b>{html.escape(r['name'])}</b> — 👥 {r['members']}")
-    bot.send_message(message.chat.id,"\n".join(lines))
+    for i,r in enumerate(rows,1):
+        members=conn.execute("SELECT user_id FROM social_clan_members WHERE chat_id=? AND clan_id=? ORDER BY joined_at",(message.chat.id,r["id"])).fetchall()
+        names=[_social_user_label(message.chat.id,int(m["user_id"])) for m in members]
+        member_text=", ".join(names) if names else "нет участников"
+        lines.append(f"{i}. <b>{html.escape(r['name'])}</b> — 👥 {r['members']}\n   👑 Владелец: {_social_user_label(message.chat.id,int(r['owner_id']))}\n   👤 {member_text}")
+    conn.close()
+    bot.send_message(message.chat.id,"\n\n".join(lines))
 
 
 @bot.message_handler(commands=["top"])
@@ -2050,7 +1893,10 @@ def handle_social_top(message: Message, period: str = "all") -> None:
     if not rows:
         bot.send_message(message.chat.id,"📊 Пока нет статистики активности.")
         return
-    lines=[f"<b>{title}</b>\n"]
+    conn=_social_db()
+    total_chat=conn.execute("SELECT COALESCE(SUM(messages),0) n FROM social_activity WHERE chat_id=?",(message.chat.id,)).fetchone()["n"]
+    conn.close()
+    lines=[f"<b>{title}</b>\n", f"💬 Всего сообщений в чате: <b>{int(total_chat):,}</b>\n"]
     medals=["🥇","🥈","🥉"]
     for i,r in enumerate(rows,1):
         raw_label=("@"+r['username']) if r['username'] else (r['first_name'] or "Пользователь")
@@ -2060,43 +1906,56 @@ def handle_social_top(message: Message, period: str = "all") -> None:
     bot.send_message(message.chat.id,"\n".join(lines))
 
 
-@bot.message_handler(commands=["topday", "topweek", "topmonth"])
+@bot.message_handler(commands=["topday", "topweek", "topmonth", "топдня", "топнедели", "топмесяца"])
 def handle_social_top_period_command(message: Message) -> None:
     cmd=(message.text or "").split()[0].lower().lstrip("/")
-    handle_social_top(message,{"topday":"day","topweek":"week","topmonth":"month"}[cmd])
+    handle_social_top(message,{"topday":"day","topweek":"week","topmonth":"month","топдня":"day","топнедели":"week","топмесяца":"month"}[cmd])
 
 
 @bot.message_handler(commands=["commands", "команды"])
 def handle_social_commands(message: Message) -> None:
-    text = (
+    text=(
         "📚 <b>Команды Berlions</b>\n\n"
-        "👤 <b>Профиль и общение</b>\n"
-        "• <code>профиль</code> — твой профиль\n"
-        "• <code>профиль @user</code> — профиль пользователя\n"
-        "• <code>награды</code> — твои награды\n"
-        "• <code>награды @user</code> — награды пользователя\n"
-        "• <code>наградить @user причина</code> — выдать награду\n"
-        "• <code>поцеловать @user</code> / ответом — поцеловать\n"
-        "• <code>обнять @user</code> / ответом — обнять\n"
-        "• <code>дай пять @user</code> / ответом — дать пять\n\n"
+        "👤 <b>Профиль</b>\n"
+        "• <code>/профиль</code> — профиль и статистика\n"
+        "• <code>/награды</code> — награды\n"
+        "• <code>/команды</code> — этот список\n\n"
         "💍 <b>Отношения</b>\n"
-        "• <code>брак @user</code> / ответом — предложение брака\n"
-        "• <code>браки</code> — статистика браков\n\n"
+        "• <code>/брак @user</code> — предложить брак\n"
+        "• <code>/браки</code> — список браков\n"
+        "• <code>/развод</code> — развестись\n\n"
         "🏰 <b>Кланы</b>\n"
-        "• <code>создать клан Название</code>\n"
-        "• <code>+клан Название</code>\n"
-        "• <code>кланы</code> — список кланов\n\n"
+        "• <code>/создать_клан Название</code> — создать клан\n"
+        "• <code>/кланы</code> — кланы и участники\n"
+        "• <code>/мой_клан</code> — управление своим кланом\n"
+        "• <code>/кик_из_клана @user</code> — исключить участника (владелец)\n"
+        "• <code>/удалить_клан</code> — удалить свой клан\n\n"
+        "😘 <b>Общение</b>\n"
+        "• <code>поцеловать @user</code> — действие, можно ответом и с репликой\n"
+        "• <code>обнять @user</code>\n"
+        "• <code>дай пять @user</code>\n"
+        "• <code>погладить @user</code>\n"
+        "• <code>пожать руку @user</code>\n\n"
         "🏆 <b>Активность</b>\n"
-        "• <code>топ</code> — общий топ\n"
+        "• <code>топ</code> — общий топ и все сообщения чата\n"
         "• <code>топ дня</code>\n"
         "• <code>топ неделя</code>\n"
         "• <code>топ месяц</code>\n\n"
-        "💰 <b>Биржа</b>\n"
-        "• <code>/market</code> • <code>/balance</code> • <code>/bonus</code>\n"
-        "• <code>/portfolio</code> • <code>/buy</code> • <code>/sell</code>\n"
-        "• <code>/exchange</code> • <code>/exchanges</code>\n\n"
-        "🎲 <code>/dice</code> — кости\n"
-        "🔎 <code>/search запрос</code> — поиск"
+        "💰 <b>Деньги и биржа</b>\n"
+        "• <code>/биржа</code> — меню биржи\n"
+        "• <code>/баланс</code> — баланс\n"
+        "• <code>/бонус</code> — ежедневный бонус\n"
+        "• <code>/работа</code> — заработать деньги раз в 30 минут\n"
+        "• <code>/рынок</code> — рынок и график\n"
+        "• <code>/портфель</code> — мои акции\n"
+        "• <code>/купить TICKER 5</code> — купить акции\n"
+        "• <code>/продать TICKER 5</code> — продать акции\n"
+        "• <code>/компании</code> — список компаний\n"
+        "• <code>/компания TICKER</code> — профиль компании\n"
+        "• <code>/держатели TICKER</code> — владельцы акций\n"
+        "• <code>/топденьги</code> — топ капитала чата\n\n"
+        "🎲 <code>/кости</code> — кости\n"
+        "🔎 <code>/поиск запрос</code> — поиск"
     )
     bot.send_message(message.chat.id,text)
 
@@ -2153,6 +2012,9 @@ def handle_social_marry_plain(message: Message) -> None:
 
 @bot.message_handler(func=lambda m: bool(m.text and re.match(r"^наградить(?:\s+.+)?$",m.text.strip(),re.I)), content_types=["text"])
 def handle_social_award(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id,"⛔ Награждать может только администратор.")
+        return
     parts=message.text.strip().split(maxsplit=2)
     if message.reply_to_message and message.reply_to_message.from_user:
         target=_social_target(message,"")
@@ -2171,6 +2033,7 @@ def handle_social_award(message: Message) -> None:
     bot.send_message(message.chat.id,f"🏆 {_social_user_label(message.chat.id,target)} <b>награждён!</b>\n🎖 Причина: <i>{html.escape(reason)}</i>")
 
 
+@bot.message_handler(commands=["создать_клан"])
 @bot.message_handler(func=lambda m: bool(m.text and re.match(r"^создать\s+клан\s+.+$",m.text.strip(),re.I)), content_types=["text"])
 def handle_social_create_clan(message: Message) -> None:
     name=message.text.strip().split(None,2)[2].strip()
@@ -2196,6 +2059,9 @@ def handle_social_join_clan(message: Message) -> None:
     conn=_social_db(); clan=conn.execute("SELECT id,name FROM social_clans WHERE chat_id=? AND name_key=?",(message.chat.id,key)).fetchone()
     if not clan:
         conn.close(); bot.send_message(message.chat.id,"❌ Такой клан не найден. Посмотри список: <code>кланы</code>"); return
+    banned=conn.execute("SELECT 1 FROM social_clan_bans WHERE chat_id=? AND clan_id=? AND user_id=?",(message.chat.id,clan['id'],message.from_user.id)).fetchone()
+    if banned:
+        conn.close(); bot.send_message(message.chat.id,"🚫 Владелец этого клана запретил тебе вступать в него."); return
     old=conn.execute("SELECT clan_id FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,message.from_user.id)).fetchone()
     if old and old['clan_id']==clan['id']:
         conn.close(); bot.send_message(message.chat.id,"🏰 Ты уже в этом клане!"); return
@@ -2203,6 +2069,85 @@ def handle_social_join_clan(message: Message) -> None:
     conn.execute("INSERT INTO social_clan_members(chat_id,clan_id,user_id,joined_at) VALUES(?,?,?,?)",(message.chat.id,clan['id'],message.from_user.id,_social_now().isoformat(sep=" ")))
     conn.commit(); conn.close()
     bot.send_message(message.chat.id,f"🏰 Добро пожаловать в клан <b>{html.escape(clan['name'])}</b>!")
+
+
+@bot.message_handler(commands=["развод"])
+def handle_social_divorce(message: Message) -> None:
+    target=None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target=message.reply_to_message.from_user.id
+    else:
+        arg=" ".join((message.text or "").split()[1:])
+        target=_social_target(message,arg)
+    conn=_social_db()
+    marriage=_social_active_marriage(conn,message.chat.id,message.from_user.id)
+    if not marriage:
+        conn.close(); bot.send_message(message.chat.id,"💔 У тебя нет активного брака."); return
+    spouse=int(marriage["user2"] if int(marriage["user1"])==message.from_user.id else marriage["user1"])
+    if target and target!=spouse and not _is_admin(message.from_user.id):
+        conn.close(); bot.send_message(message.chat.id,"💔 Укажи своего супруга или ответь на его сообщение."); return
+    conn.execute("UPDATE social_marriages SET active=0 WHERE id=?",(marriage["id"],)); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"💔 {_social_user_label(message.chat.id,message.from_user.id)} и {_social_user_label(message.chat.id,spouse)} больше не состоят в браке.")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"развод(?:\s+@\w+)?",m.text.strip(),re.I)), content_types=["text"])
+def handle_social_divorce_plain(message: Message) -> None:
+    handle_social_divorce(message)
+
+
+@bot.message_handler(commands=["мой_клан", "управление_кланом"])
+def handle_my_clan(message: Message) -> None:
+    conn=_social_db()
+    clan=conn.execute("SELECT c.* FROM social_clans c JOIN social_clan_members m ON m.clan_id=c.id WHERE c.chat_id=? AND m.user_id=?",(message.chat.id,message.from_user.id)).fetchone()
+    if not clan:
+        conn.close(); bot.send_message(message.chat.id,"🏰 Ты пока не состоишь в клане."); return
+    members=conn.execute("SELECT user_id,joined_at FROM social_clan_members WHERE chat_id=? AND clan_id=? ORDER BY joined_at",(message.chat.id,clan["id"])).fetchall()
+    bans=conn.execute("SELECT user_id FROM social_clan_bans WHERE chat_id=? AND clan_id=?",(message.chat.id,clan["id"])).fetchall()
+    conn.close()
+    lines=[f"🏰 <b>{html.escape(clan['name'])}</b>",f"👑 Владелец: {_social_user_label(message.chat.id,int(clan['owner_id']))}",f"👥 Участников: <b>{len(members)}</b>","","<b>Участники:</b>"]
+    for m in members: lines.append(f"• {_social_user_label(message.chat.id,int(m['user_id']))}")
+    if int(clan["owner_id"])==message.from_user.id:
+        lines += ["", "⚙️ <b>Управление владельца:</b>","/кик_из_клана @user — исключить и запретить повторный вход","/удалить_клан — удалить клан"]
+        if bans: lines.append(f"🚫 Заблокировано в клане: <b>{len(bans)}</b>")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"мой\s+клан",m.text.strip(),re.I)), content_types=["text"])
+def handle_my_clan_plain(message: Message) -> None:
+    handle_my_clan(message)
+
+
+def _clan_owner_for_user(conn, chat_id, user_id):
+    return conn.execute("SELECT c.* FROM social_clans c JOIN social_clan_members m ON m.clan_id=c.id WHERE c.chat_id=? AND m.user_id=?",(chat_id,user_id)).fetchone()
+
+
+@bot.message_handler(commands=["кик_из_клана"])
+def handle_clan_kick(message: Message) -> None:
+    if not _is_admin(message.from_user.id) and not message.reply_to_message and len((message.text or "").split())<2:
+        bot.send_message(message.chat.id,"❓ Формат: <code>/кик_из_клана @user</code> или ответом на сообщение."); return
+    target=message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else _social_target(message," ".join((message.text or "").split()[1:]))
+    if not target: bot.send_message(message.chat.id,"❓ Не удалось определить пользователя."); return
+    conn=_social_db(); clan=_clan_owner_for_user(conn,message.chat.id,message.from_user.id)
+    if not clan and not _is_admin(message.from_user.id): conn.close(); bot.send_message(message.chat.id,"⛔ Только владелец клана может исключать участников."); return
+    if clan and target==int(clan["owner_id"]): conn.close(); bot.send_message(message.chat.id,"❌ Нельзя исключить владельца клана."); return
+    target_clan=conn.execute("SELECT clan_id FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,target)).fetchone()
+    if not target_clan or (clan and int(target_clan["clan_id"])!=int(clan["id"])):
+        conn.close(); bot.send_message(message.chat.id,"❌ Пользователь не состоит в твоём клане."); return
+    cid=int(target_clan["clan_id"]); conn.execute("DELETE FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,target)); conn.execute("INSERT OR REPLACE INTO social_clan_bans(chat_id,clan_id,user_id,banned_at) VALUES(?,?,?,?)",(message.chat.id,cid,target,_social_now().isoformat(sep=" "))); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"🚫 {_social_user_label(message.chat.id,target)} исключён из клана и больше не сможет в него вступить.")
+
+
+@bot.message_handler(commands=["удалить_клан"])
+def handle_delete_clan(message: Message) -> None:
+    conn=_social_db(); clan=_clan_owner_for_user(conn,message.chat.id,message.from_user.id)
+    if not clan and not _is_admin(message.from_user.id): conn.close(); bot.send_message(message.chat.id,"⛔ Только владелец клана может удалить его."); return
+    if clan:
+        cid=int(clan["id"]); conn.execute("DELETE FROM social_clan_members WHERE chat_id=? AND clan_id=?",(message.chat.id,cid)); conn.execute("DELETE FROM social_clan_bans WHERE chat_id=? AND clan_id=?",(message.chat.id,cid)); conn.execute("DELETE FROM social_clans WHERE id=?",(cid,))
+    else:
+        # глобальный админ: удаление клана, в котором он состоит, либо ничего
+        cidrow=conn.execute("SELECT id FROM social_clans WHERE chat_id=? AND owner_id=?",(message.chat.id,message.from_user.id)).fetchone()
+        if cidrow: cid=int(cidrow["id"]); conn.execute("DELETE FROM social_clan_members WHERE clan_id=?",(cid,)); conn.execute("DELETE FROM social_clan_bans WHERE clan_id=?",(cid,)); conn.execute("DELETE FROM social_clans WHERE id=?",(cid,))
+    conn.commit(); conn.close(); bot.send_message(message.chat.id,"🗑 Клан удалён.")
 
 
 @bot.message_handler(commands=["marry", "брак"])
@@ -2248,35 +2193,31 @@ def handle_social_marriage_callback(call: CallbackQuery) -> None:
         except Exception: pass
 
 
-@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^(поцеловать|поцеловал|поцеловала|обнять|обнял|обняла|дай пять|дать пять|погладить|пожать руку)\b",m.text.strip(),re.I)), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^(поцеловать|обнять|дай пять|дать пять|погладить|пожать руку)\b",m.text.strip(),re.I)), content_types=["text"])
 def handle_social_roleplay(message: Message) -> None:
-    parts=message.text.strip().split(maxsplit=1)
+    raw=message.text.strip()
+    parts=raw.split(maxsplit=1)
     action=parts[0].lower()
-    target=_social_target(message,parts[1] if len(parts)>1 else "")
+    rest=parts[1].strip() if len(parts)>1 else ""
+    target=_social_target(message,rest)
+    # Для reply команда может содержать реплику без username.
+    quote=""
+    if message.reply_to_message and rest:
+        quote=rest
+    elif target and rest:
+        tokens=rest.split(maxsplit=1)
+        quote=tokens[1] if len(tokens)>1 else ""
     if not target:
-        bot.send_message(message.chat.id,f"💫 Формат: <code>{html.escape(action)} @user</code> или просто ответь этой командой на сообщение."); return
+        bot.send_message(message.chat.id,f"💫 Формат: <code>{html.escape(action)} @user</code> или ответом на сообщение."); return
+    actor=_social_user_label(message.chat.id,message.from_user.id)
     target_label=_social_user_label(message.chat.id,target)
-    replies={
-        "поцеловать": f"💋 {target_label}, тебя только что поцеловали!",
-        "поцеловал": f"💋 {target_label}, тебя поцеловали!",
-        "поцеловала": f"💋 {target_label}, тебя поцеловали!",
-        "обнять": f"🤗 {target_label}, тебя крепко обняли!",
-        "обнял": f"🤗 {target_label}, тебя крепко обняли!",
-        "обняла": f"🤗 {target_label}, тебя крепко обняли!",
-        "дай пять": f"🖐 {target_label}, вам дали пять!",
-        "дать пять": f"🖐 {target_label}, вам дали пять!",
-        "погладить": f"🥰 {target_label}, тебя нежно погладили!",
-        "пожать руку": f"🤝 {target_label}, вам пожали руку!",
-    }
-    bot.send_message(message.chat.id,replies.get(action,f"✨ {target_label} — действие выполнено!"))
+    verbs={"поцеловать":"поцеловал","обнять":"обнял","дай пять":"дал пять","дать пять":"дал пять","погладить":"погладил","пожать руку":"пожал руку"}
+    emoji={"поцеловать":"😘","обнять":"🤗","дай пять":"🖐","дать пять":"🖐","погладить":"🥰","пожать руку":"🤝"}
+    text=f"{emoji[action]} | {actor} <b>{verbs[action]}</b> {target_label}"
+    if quote:
+        text += f"\nс репликой: <i>{html.escape(quote)}</i>"
+    bot.send_message(message.chat.id,text)
 
-
-@bot.message_handler(commands=["learn"])
-def handle_learn(message: Message) -> None:
-    if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 5:
-        bot.send_message(message.chat.id, "⛔ Только глава или глобальный.")
-        return
-    bot.send_message(message.chat.id, "✅ /learn активирован. Полная история чата пока не поддерживается (ограничения Telegram).")
 
 # Последний обработчик сообщений: собирает активность, не перехватывая уже обработанные команды.
 @bot.message_handler(content_types=["text"])
