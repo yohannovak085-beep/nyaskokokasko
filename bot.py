@@ -3,7 +3,7 @@ Telegram bot with deep-link support, subscription gate (channel & chat),
 dice game, admin manager and AUTO-BROADCAST system.
 
 Environment variables (Replit Secrets):
-  BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+  BOT_TOKEN = os.getenv("BOT_TOKEN", "8991743492:AAEARGFrWescfL4f69XDCnEsuI7dJJDi8AI").strip()
   ADMIN_ID   — primary admin Telegram user ID (integer)
 
 IMPORTANT: Add this bot as an Administrator to both @Berlions_mb and @Chats_Berlions
@@ -36,7 +36,7 @@ _dice_cooldown: dict[int, float] = {}
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8991743492:AAEARGFrWescfL4f69XDCnEsuI7dJJDi8AI").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "")
 GROUPS_FILE = "groups.json" # Файл для хранения ID групп
 
