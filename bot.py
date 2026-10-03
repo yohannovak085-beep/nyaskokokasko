@@ -389,6 +389,16 @@ EXCHANGE_MAX_TRADE = 100_000
 EXCHANGE_DEFAULT_TOTAL_SHARES = 1_000_000
 EXCHANGE_OWNER_SHARES = 700_000
 EXCHANGE_FLOAT_SHARES = 300_000
+EXCHANGE_TRADE_COOLDOWN = 5
+EXCHANGE_MARKET_COOLDOWN = 10
+EXCHANGE_TRADE_FEE = 0.015
+EXCHANGE_OWNER_FEE_SHARE = 0.35
+EXCHANGE_MIN_DEPOSIT = 5_000
+EXCHANGE_DEPOSIT_RATE = 0.02
+EXCHANGE_LOAN_LIMIT = 2_000_000
+EXCHANGE_LOAN_RATE = 0.12
+_ex_trade_cooldown: dict[int, float] = {}
+_ex_market_cooldown: dict[int, float] = {}
 
 
 def _ex_db():
@@ -451,6 +461,8 @@ def _ex_init_db():
         total REAL NOT NULL,
         ts TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS ex_deposits (user_id INTEGER PRIMARY KEY, principal REAL NOT NULL DEFAULT 0, started_at TEXT NOT NULL, last_claim TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS ex_loans (user_id INTEGER PRIMARY KEY, principal REAL NOT NULL DEFAULT 0, debt REAL NOT NULL DEFAULT 0, started_at TEXT NOT NULL);
     """)
 
     # Миграция старой базы: существующие таблицы не удаляем.
@@ -458,6 +470,13 @@ def _ex_init_db():
     _ex_add_column(conn, "ex_exchanges", "treasury_shares", "INTEGER NOT NULL DEFAULT 1000000")
     _ex_add_column(conn, "ex_exchanges", "description", "TEXT NOT NULL DEFAULT ''")
     _ex_add_column(conn, "ex_exchanges", "active", "INTEGER NOT NULL DEFAULT 1")
+    _ex_add_column(conn, "ex_exchanges", "treasury", "REAL NOT NULL DEFAULT 0")
+    _ex_add_column(conn, "ex_exchanges", "level", "INTEGER NOT NULL DEFAULT 1")
+    _ex_add_column(conn, "ex_exchanges", "popularity", "INTEGER NOT NULL DEFAULT 50")
+    _ex_add_column(conn, "ex_exchanges", "trade_volume", "REAL NOT NULL DEFAULT 0")
+    _ex_add_column(conn, "ex_exchanges", "dividends_paid", "REAL NOT NULL DEFAULT 0")
+    _ex_add_column(conn, "ex_traders", "reputation", "INTEGER NOT NULL DEFAULT 50")
+    _ex_add_column(conn, "ex_traders", "last_trade", "TEXT")
 
     row = conn.execute("SELECT id,total_shares,treasury_shares FROM ex_exchanges WHERE ticker=?", (EXCHANGE_DEFAULT_TICKER,)).fetchone()
     if row is None:
@@ -669,6 +688,12 @@ def _ex_markup():
     return markup
 
 
+def _ex_cd(bucket: dict[int,float], user_id: int, seconds: int) -> int:
+    now=time.time(); left=seconds-(now-bucket.get(user_id,0))
+    if left>0: return max(1,int(left+0.999))
+    bucket[user_id]=now; return 0
+
+
 def _ex_replace_market(chat_id: int, user_id: int, exchange_id: int = 1):
     _ex_ensure_trader(user_id)
     conn=_ex_db(); ex=conn.execute("SELECT id FROM ex_exchanges WHERE id=?",(exchange_id,)).fetchone()
@@ -695,7 +720,7 @@ def handle_exchange(message: Message) -> None:
         "💰 /бонус — ежедневный бонус 1 000 ₽\n💵 /баланс — баланс\n💼 /работа — заработать деньги\n📈 /рынок — рынок и график\n"
         "💼 /портфель — мои акции\n🛒 /купить TICKER 5 — купить\n💸 /продать TICKER 5 — продать\n"
         "🏭 /создать_компанию Название TICKER — создать компанию\n🏢 /компания TICKER — профиль компании\n"
-        "📋 /компании — все компании\n👥 /держатели TICKER — крупнейшие держатели\n⚙️ /управление_компанией TICKER ... — управление компанией\n🏆 /топденьги — капитал игроков\n\n"
+        "📋 /компании — все компании\n👥 /держатели TICKER — крупнейшие держатели\n⚙️ /управление_компанией TICKER ... — управление компанией\n💎 /дивиденды TICKER 100000 — дивиденды\n🚀 /улучшить TICKER маркетинг — развитие\n🎯 /контроль TICKER — контрольный пакет\n🏦 /банк — банк и кредиты\n🧠 /репутация — репутация\n🏆 /топденьги — капитал игроков\n\n"
         "Цена двигается от реальных сделок: покупки создают спрос, продажи — давление предложения.")
 
 
@@ -717,7 +742,11 @@ def handle_exchange_balance(message: Message) -> None:
 
 @bot.message_handler(commands=["market", "рынок"])
 def handle_exchange_market(message: Message) -> None:
-    try: _ex_require_user(message); _ex_replace_market(message.chat.id,message.from_user.id,1)
+    try:
+        wait=_ex_cd(_ex_market_cooldown,message.from_user.id,EXCHANGE_MARKET_COOLDOWN)
+        if wait:
+            bot.send_message(message.chat.id,f"⏳ Рынок можно обновлять раз в {EXCHANGE_MARKET_COOLDOWN} сек. Ещё <b>{wait} сек.</b>"); return
+        _ex_require_user(message); _ex_replace_market(message.chat.id,message.from_user.id,1)
     except Exception as exc:
         logger.exception("/market error: %s",exc); bot.send_message(message.chat.id,"❌ Не удалось открыть рынок.\n\nТехническая ошибка: <code>"+html.escape(str(exc))+"</code>")
 
@@ -748,21 +777,29 @@ def _ex_parse_trade(message):
 def handle_exchange_buy(message: Message) -> None:
     parsed=_ex_parse_trade(message)
     if not parsed: return
-    ticker,shares=parsed; user_id=message.from_user.id; _ex_ensure_trader(user_id); conn=_ex_db()
+    ticker,shares=parsed; user_id=message.from_user.id
+    wait=_ex_cd(_ex_trade_cooldown,user_id,EXCHANGE_TRADE_COOLDOWN)
+    if wait: bot.send_message(message.chat.id,f"⏳ Слишком быстро. Следующая сделка через <b>{wait} сек.</b>"); return
+    _ex_ensure_trader(user_id); conn=_ex_db()
     ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
     if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Такой акции нет. Посмотри /companies"); return
     if not ex["active"]: conn.close(); bot.send_message(message.chat.id,"🔴 Эта компания закрыта, новые сделки недоступны."); return
     available=int(ex["treasury_shares"])
     if available<shares:
         conn.close(); bot.send_message(message.chat.id,f"❌ На рынке сейчас только <b>{available:,}</b> свободных акций <code>{ticker}</code>.\nКто-то должен продать свои акции."); return
-    price=float(ex["price"]); total=price*shares
+    price=float(ex["price"]); total=price*shares; fee=total*EXCHANGE_TRADE_FEE; need=total+fee
     trader=conn.execute("SELECT balance FROM ex_traders WHERE user_id=?",(user_id,)).fetchone()
-    if float(trader["balance"])<total: conn.close(); bot.send_message(message.chat.id,f"❌ Недостаточно денег. Нужно <b>{total:,.2f} ₽</b>."); return
+    if float(trader["balance"])<need: conn.close(); bot.send_message(message.chat.id,f"❌ Недостаточно денег. Нужно <b>{need:,.2f} ₽</b> с учётом комиссии <b>{fee:,.2f} ₽</b>."); return
     holding=conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?",(user_id,ex["id"])).fetchone()
     old_shares=int(holding["shares"]) if holding else 0; old_avg=float(holding["avg_price"]) if holding else 0.0; new_shares=old_shares+shares
     new_avg=((old_shares*old_avg)+(price*shares))/new_shares
     impact=_ex_trade_impact(shares,available)
-    conn.execute("UPDATE ex_traders SET balance=balance-? WHERE user_id=?",(total,user_id))
+    conn.execute("UPDATE ex_traders SET balance=balance-?,reputation=MIN(100,reputation+1),last_trade=? WHERE user_id=?",(need,datetime.now().isoformat(timespec="seconds"),user_id))
+    owner_share=fee*EXCHANGE_OWNER_FEE_SHARE; company_share=fee-owner_share
+    if int(ex["owner_id"]):
+        conn.execute("INSERT OR IGNORE INTO ex_traders(user_id,balance) VALUES(?,?)",(int(ex["owner_id"]),EXCHANGE_START_BALANCE))
+        conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?",(owner_share,int(ex["owner_id"])))
+    conn.execute("UPDATE ex_exchanges SET treasury=treasury+?,trade_volume=trade_volume+? WHERE id=?",(company_share,total,ex["id"]))
     conn.execute("INSERT INTO ex_holdings(user_id,exchange_id,shares,avg_price) VALUES(?,?,?,?) ON CONFLICT(user_id,exchange_id) DO UPDATE SET shares=excluded.shares,avg_price=excluded.avg_price",(user_id,ex["id"],new_shares,new_avg))
     conn.execute("UPDATE ex_exchanges SET treasury_shares=treasury_shares-? WHERE id=?",(shares,ex["id"]))
     new_price,change=_ex_change_price(conn,ex["id"],impact)
@@ -777,15 +814,23 @@ def handle_exchange_buy(message: Message) -> None:
 def handle_exchange_sell(message: Message) -> None:
     parsed=_ex_parse_trade(message)
     if not parsed: return
-    ticker,shares=parsed; user_id=message.from_user.id; _ex_ensure_trader(user_id); conn=_ex_db()
+    ticker,shares=parsed; user_id=message.from_user.id
+    wait=_ex_cd(_ex_trade_cooldown,user_id,EXCHANGE_TRADE_COOLDOWN)
+    if wait: bot.send_message(message.chat.id,f"⏳ Слишком быстро. Следующая сделка через <b>{wait} сек.</b>"); return
+    _ex_ensure_trader(user_id); conn=_ex_db()
     ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
     if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Такой акции нет. Посмотри /companies"); return
     if not ex["active"]: conn.close(); bot.send_message(message.chat.id,"🔴 Эта компания закрыта, новые сделки недоступны."); return
     holding=conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?",(user_id,ex["id"])).fetchone()
     if not holding or int(holding["shares"])<shares: conn.close(); bot.send_message(message.chat.id,"❌ У тебя недостаточно этих акций."); return
-    price=float(ex["price"]); total=price*shares; treasury_before=int(ex["treasury_shares"]); remaining=int(holding["shares"])-shares
+    price=float(ex["price"]); gross=price*shares; fee=gross*EXCHANGE_TRADE_FEE; total=gross-fee; treasury_before=int(ex["treasury_shares"]); remaining=int(holding["shares"])-shares
     impact=_ex_trade_impact(shares,max(10_000,treasury_before+shares))
-    conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?",(total,user_id))
+    conn.execute("UPDATE ex_traders SET balance=balance+?,reputation=MIN(100,reputation+1),last_trade=? WHERE user_id=?",(total,datetime.now().isoformat(timespec="seconds"),user_id))
+    owner_share=fee*EXCHANGE_OWNER_FEE_SHARE; company_share=fee-owner_share
+    if int(ex["owner_id"]):
+        conn.execute("INSERT OR IGNORE INTO ex_traders(user_id,balance) VALUES(?,?)",(int(ex["owner_id"]),EXCHANGE_START_BALANCE))
+        conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?",(owner_share,int(ex["owner_id"])))
+    conn.execute("UPDATE ex_exchanges SET treasury=treasury+?,trade_volume=trade_volume+? WHERE id=?",(company_share,gross,ex["id"]))
     if remaining: conn.execute("UPDATE ex_holdings SET shares=? WHERE user_id=? AND exchange_id=?",(remaining,user_id,ex["id"]))
     else: conn.execute("DELETE FROM ex_holdings WHERE user_id=? AND exchange_id=?",(user_id,ex["id"]))
     conn.execute("UPDATE ex_exchanges SET treasury_shares=treasury_shares+? WHERE id=?",(shares,ex["id"]))
@@ -818,14 +863,17 @@ def handle_create_exchange(message: Message) -> None:
 def handle_company(message: Message) -> None:
     parts=(message.text or "").split(maxsplit=1)
     if len(parts)<2: bot.send_message(message.chat.id,"❓ Формат: <code>/company BERL</code>"); return
-    conn=_ex_db(); ex=_ex_company_row(conn,parts[1].strip()); conn.close()
-    if not ex: bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    conn=_ex_db(); ex=_ex_company_row(conn,parts[1].strip())
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    top=conn.execute("SELECT user_id,shares FROM ex_holdings WHERE exchange_id=? AND shares>0 ORDER BY shares DESC LIMIT 1",(ex["id"],)).fetchone(); conn.close()
     path=_ex_chart(ex["id"])
     owner=_ex_user_mention(message.chat.id,int(ex["owner_id"]),"Рынок") if int(ex["owner_id"]) else "Berlions"
+    control=_ex_user_mention(message.chat.id,int(top["user_id"]),"Никто") if top else "Никто"
+    control_pct=(int(top["shares"])/max(1,int(ex["total_shares"]))*100) if top else 0
     text=(f"🏢 <b>{html.escape(ex['name'])}</b>  <code>${html.escape(ex['ticker'])}</code>\n\n"
           f"📝 {html.escape(ex['description'] or 'Описание отсутствует.')}\n\n"
           f"💰 Цена: <b>{float(ex['price']):,.2f} ₽</b>\n📊 Капитализация: <b>{float(ex['price'])*int(ex['total_shares']):,.2f} ₽</b>\n"
-          f"📦 Акций: <b>{int(ex['total_shares']):,}</b>\n🛒 В продаже: <b>{int(ex['treasury_shares']):,}</b>\n👑 Владелец: {owner}\n"
+          f"📦 Акций: <b>{int(ex['total_shares']):,}</b>\n🛒 В продаже: <b>{int(ex['treasury_shares']):,}</b>\n🏦 Казна: <b>{float(ex['treasury']):,.0f} ₽</b>\n⭐ Уровень: <b>{int(ex['level'])}</b> · 🔥 Популярность: <b>{int(ex['popularity'])}/100</b>\n👑 Владелец: {owner}\n🎯 Контроль: {control} — <b>{control_pct:.1f}%</b>\n"
           f"{'🟢 Торги открыты' if ex['active'] else '🔴 Торги закрыты'}\n\n"
           f"Покупка: <code>/buy {ex['ticker']} 100</code>\nПродажа: <code>/sell {ex['ticker']} 100</code>\nДержатели: <code>/holders {ex['ticker']}</code>")
     with open(path,"rb") as photo: bot.send_photo(message.chat.id,photo,caption=text)
@@ -1003,6 +1051,111 @@ def handle_exchange_callback(call: CallbackQuery) -> None:
 
 # ── END BERLIONS EXCHANGE SYSTEM ───────────────────────────────────────────────
 
+
+# ── ADVANCED ECONOMY ───────────────────────────────────────────────────────────
+
+def _ex_money_fmt(v: float) -> str: return f"{v:,.0f} ₽"
+
+def _ex_holder_control(conn, exchange_id: int):
+    return conn.execute("SELECT user_id,shares FROM ex_holdings WHERE exchange_id=? AND shares>0 ORDER BY shares DESC LIMIT 1",(exchange_id,)).fetchone()
+
+@bot.message_handler(commands=["банк"])
+def handle_ex_bank(message: Message) -> None:
+    uid=message.from_user.id; _ex_ensure_trader(uid); conn=_ex_db(); dep=conn.execute("SELECT * FROM ex_deposits WHERE user_id=?",(uid,)).fetchone(); loan=conn.execute("SELECT * FROM ex_loans WHERE user_id=?",(uid,)).fetchone(); conn.close()
+    d="нет" if not dep else f"{_ex_money_fmt(dep['principal'])} · 2%/день"; l="нет" if not loan else f"{_ex_money_fmt(loan['debt'])}"
+    bot.send_message(message.chat.id,f"🏦 <b>БЕРЛИОНС БАНК</b>\n\n💰 Вклад: <b>{d}</b>\n💳 Долг: <b>{l}</b>\n\n/вклад 50000\n/забрать_вклад\n/кредит 100000\n/погасить_кредит 100000")
+
+@bot.message_handler(commands=["вклад"])
+def handle_ex_deposit(message: Message) -> None:
+    p=(message.text or '').split(); uid=message.from_user.id; _ex_ensure_trader(uid)
+    if len(p)!=2 or not p[1].isdigit() or int(p[1])<EXCHANGE_MIN_DEPOSIT: bot.send_message(message.chat.id,f"❓ Формат: <code>/вклад 50000</code>. Минимум {EXCHANGE_MIN_DEPOSIT:,} ₽"); return
+    amount=float(p[1]); conn=_ex_db(); dep=conn.execute("SELECT * FROM ex_deposits WHERE user_id=?",(uid,)).fetchone(); bal=conn.execute("SELECT balance FROM ex_traders WHERE user_id=?",(uid,))["balance"]
+    if dep: conn.close(); bot.send_message(message.chat.id,"❌ У тебя уже есть вклад."); return
+    if bal<amount: conn.close(); bot.send_message(message.chat.id,"❌ Недостаточно денег."); return
+    now=datetime.now().isoformat(timespec='seconds'); conn.execute("UPDATE ex_traders SET balance=balance-? WHERE user_id=?",(amount,uid)); conn.execute("INSERT INTO ex_deposits VALUES(?,?,?,?)",(uid,amount,now,now)); conn.commit(); conn.close(); bot.send_message(message.chat.id,f"🏦 Вклад открыт: <b>{_ex_money_fmt(amount)}</b> · 2% в день.")
+
+@bot.message_handler(commands=["забрать_вклад"])
+def handle_ex_deposit_withdraw(message: Message) -> None:
+    uid=message.from_user.id; _ex_ensure_trader(uid); conn=_ex_db(); d=conn.execute("SELECT * FROM ex_deposits WHERE user_id=?",(uid,)).fetchone()
+    if not d: conn.close(); bot.send_message(message.chat.id,"❌ Вклада нет."); return
+    days=max(0,(datetime.now()-datetime.fromisoformat(d['started_at'])).total_seconds()/86400); profit=float(d['principal'])*EXCHANGE_DEPOSIT_RATE*days; total=float(d['principal'])+profit
+    conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?",(total,uid)); conn.execute("DELETE FROM ex_deposits WHERE user_id=?",(uid,)); conn.commit(); conn.close(); bot.send_message(message.chat.id,f"🏦 Вклад закрыт.\n💰 Возвращено: <b>{_ex_money_fmt(total)}</b>\n📈 Доход: <b>+{_ex_money_fmt(profit)}</b>")
+
+@bot.message_handler(commands=["кредит"])
+def handle_ex_loan(message: Message) -> None:
+    p=(message.text or '').split(); uid=message.from_user.id; _ex_ensure_trader(uid)
+    if len(p)!=2 or not p[1].isdigit() or int(p[1])<=0: bot.send_message(message.chat.id,"❓ Формат: <code>/кредит 100000</code>"); return
+    amount=float(p[1]); conn=_ex_db(); loan=conn.execute("SELECT * FROM ex_loans WHERE user_id=?",(uid,)).fetchone()
+    if loan: conn.close(); bot.send_message(message.chat.id,"❌ Сначала погаси текущий кредит."); return
+    if amount>EXCHANGE_LOAN_LIMIT: conn.close(); bot.send_message(message.chat.id,f"❌ Лимит: {EXCHANGE_LOAN_LIMIT:,} ₽."); return
+    debt=amount*(1+EXCHANGE_LOAN_RATE); conn.execute("INSERT INTO ex_loans VALUES(?,?,?,?)",(uid,amount,debt,datetime.now().isoformat(timespec='seconds'))); conn.execute("UPDATE ex_traders SET balance=balance+?,reputation=MAX(0,reputation-1) WHERE user_id=?",(amount,uid)); conn.commit(); conn.close(); bot.send_message(message.chat.id,f"💳 Получено: <b>{_ex_money_fmt(amount)}</b>\n📌 Вернуть: <b>{_ex_money_fmt(debt)}</b>")
+
+@bot.message_handler(commands=["погасить_кредит"])
+def handle_ex_loan_pay(message: Message) -> None:
+    uid=message.from_user.id; _ex_ensure_trader(uid); conn=_ex_db(); loan=conn.execute("SELECT * FROM ex_loans WHERE user_id=?",(uid,)).fetchone(); bal=conn.execute("SELECT balance FROM ex_traders WHERE user_id=?",(uid,))["balance"]
+    if not loan: conn.close(); bot.send_message(message.chat.id,"❌ Кредита нет."); return
+    p=(message.text or '').split(); req=float(loan['debt']) if len(p)==1 else (float(p[1]) if p[1].replace('.','',1).isdigit() else 0); pay=min(req,float(bal),float(loan['debt']))
+    if pay<=0: conn.close(); bot.send_message(message.chat.id,"❌ Недостаточно денег."); return
+    debt=float(loan['debt'])-pay; conn.execute("UPDATE ex_traders SET balance=balance-? WHERE user_id=?",(pay,uid))
+    if debt<=0.01: conn.execute("DELETE FROM ex_loans WHERE user_id=?",(uid,)); tail="🎉 Кредит погашен полностью!"
+    else: conn.execute("UPDATE ex_loans SET debt=? WHERE user_id=?",(debt,uid)); tail=f"💳 Остаток: <b>{_ex_money_fmt(debt)}</b>"
+    conn.commit(); conn.close(); bot.send_message(message.chat.id,f"💸 Платёж: <b>{_ex_money_fmt(pay)}</b>\n{tail}")
+
+@bot.message_handler(commands=["репутация"])
+def handle_ex_rep(message: Message) -> None:
+    r=_ex_ensure_trader(message.from_user.id); bot.send_message(message.chat.id,f"🧠 <b>Репутация трейдера</b>\n\n⭐ <b>{int(r['reputation'])}/100</b>\n\nТорговая активность повышает рейтинг.")
+
+@bot.message_handler(commands=["дивиденды"])
+def handle_ex_dividends(message: Message) -> None:
+    p=(message.text or '').split(); uid=message.from_user.id
+    if len(p)!=3 or not p[2].isdigit() or int(p[2])<=0: bot.send_message(message.chat.id,"❓ Формат: <code>/дивиденды TICKER 100000</code>"); return
+    ticker=p[1].upper(); amount=float(p[2]); conn=_ex_db(); ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    if int(ex['owner_id'])!=uid: conn.close(); bot.send_message(message.chat.id,"⛔ Только владелец."); return
+    if float(ex['treasury'])<amount: conn.close(); bot.send_message(message.chat.id,"❌ В казне недостаточно денег."); return
+    hs=conn.execute("SELECT user_id,shares FROM ex_holdings WHERE exchange_id=? AND shares>0",(ex['id'],)).fetchall(); total=sum(int(x['shares']) for x in hs)
+    for h in hs:
+        pay=amount*int(h['shares'])/total; conn.execute("INSERT OR IGNORE INTO ex_traders(user_id,balance) VALUES(?,?)",(int(h['user_id']),EXCHANGE_START_BALANCE)); conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?",(pay,int(h['user_id'])))
+    conn.execute("UPDATE ex_exchanges SET treasury=treasury-?,dividends_paid=dividends_paid+? WHERE id=?",(amount,amount,ex['id'])); conn.commit(); conn.close(); bot.send_message(message.chat.id,f"💎 <b>{ticker}</b> выплатила акционерам <b>{_ex_money_fmt(amount)}</b> дивидендов.")
+
+@bot.message_handler(commands=["улучшить"])
+def handle_ex_upgrade(message: Message) -> None:
+    p=(message.text or '').split(maxsplit=2); uid=message.from_user.id
+    if len(p)!=3: bot.send_message(message.chat.id,"❓ <code>/улучшить TICKER маркетинг</code>\nВарианты: маркетинг, разработка, производство"); return
+    ticker,kind=p[1].upper(),p[2].lower(); costs={'маркетинг':100000,'разработка':250000,'производство':500000}
+    if kind not in costs: bot.send_message(message.chat.id,"❌ Варианты: маркетинг, разработка, производство."); return
+    conn=_ex_db(); ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(ticker,)).fetchone()
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    if int(ex['owner_id'])!=uid: conn.close(); bot.send_message(message.chat.id,"⛔ Только владелец."); return
+    cost=costs[kind]*int(ex['level'])
+    if float(ex['treasury'])<cost: conn.close(); bot.send_message(message.chat.id,f"❌ В казне нужно {_ex_money_fmt(cost)}."); return
+    pop=min(100,int(ex['popularity'])+(8 if kind=='маркетинг' else 4)); lvl=int(ex['level'])+1; conn.execute("UPDATE ex_exchanges SET treasury=treasury-?,level=?,popularity=? WHERE id=?",(cost,lvl,pop,ex['id'])); conn.commit(); conn.close(); bot.send_message(message.chat.id,f"🚀 <b>{ticker}</b> улучшена!\n\n⚙️ {kind}\n⭐ Уровень: <b>{lvl}</b>\n🔥 Популярность: <b>{pop}/100</b>\n💸 Потрачено: <b>{cost:,} ₽</b>")
+
+@bot.message_handler(commands=["топакций"])
+def handle_ex_top_shares(message: Message) -> None:
+    conn=_ex_db(); rows=conn.execute("""
+        SELECT h.user_id, SUM(h.shares) AS shares, SUM(h.shares*e.price) AS value
+        FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id
+        WHERE h.shares>0 AND e.active=1
+        GROUP BY h.user_id ORDER BY value DESC LIMIT 20
+    """).fetchall(); conn.close()
+    if not rows: bot.send_message(message.chat.id,"🏆 Пока никто не владеет акциями."); return
+    lines=["🏆 <b>ТОП АКЦИОНЕРОВ</b>","<i>По текущей стоимости всех пакетов</i>",""]
+    for i,r in enumerate(rows,1):
+        lines.append(f"{i}. {_ex_user_mention(message.chat.id,int(r['user_id']))} — <b>{float(r['value']):,.0f} ₽</b> · {int(r['shares']):,} акций")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(commands=["контроль"])
+def handle_ex_control(message: Message) -> None:
+    p=(message.text or '').split();
+    if len(p)!=2: bot.send_message(message.chat.id,"❓ <code>/контроль TICKER</code>"); return
+    conn=_ex_db(); ex=conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?",(p[1].upper(),)).fetchone()
+    if not ex: conn.close(); bot.send_message(message.chat.id,"❌ Компания не найдена."); return
+    h=_ex_holder_control(conn,ex['id']); conn.close()
+    if not h: bot.send_message(message.chat.id,"👥 Акционеров пока нет."); return
+    pct=int(h['shares'])/max(1,int(ex['total_shares']))*100; state='👑 КОНТРОЛЬНЫЙ ПАКЕТ' if pct>=50 else '📊 Миноритарный пакет'
+    bot.send_message(message.chat.id,f"🎯 <b>Контроль {html.escape(ex['ticker'])}</b>\n\n{_ex_user_mention(message.chat.id,int(h['user_id']))}\n📦 {int(h['shares']):,} акций · <b>{pct:.1f}%</b>\n\n{state}")
 
 # ── Dice game logic ───────────────────────────────────────────────────────────
 
