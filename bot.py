@@ -16,6 +16,7 @@ import html
 import io
 import random
 import logging
+import sqlite3
 from dotenv import load_dotenv
 import telebot
 from telebot.types import (
@@ -26,6 +27,8 @@ from telebot.types import (
     InputMediaDocument,
     Message,
     CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telebot.apihelper import ApiTelegramException
 
@@ -73,7 +76,103 @@ database.init_db()
 # ── In-memory conversation state ──────────────────────────────────────────────
 
 _pending: dict[int, dict] = {}
+_order_pending: dict[int, int] = {}  # user_id -> chat_id, пока пользователь вводит заказ
 _stupid_stats: dict[int, dict] = {} # пока не используется, но оставлено по структуре
+
+# ── BERLIONS GAME REQUESTS ─────────────────────────────────────────────────────
+# Отдельная БД: не смешиваем заказы с основной БД игр/контента.
+ORDERS_DB = "orders.db"
+RANDOM_GAME_COOLDOWN = 30 * 60
+
+def _orders_db():
+    conn = sqlite3.connect(ORDERS_DB, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+def _orders_init_db() -> None:
+    conn = _orders_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS game_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        name_key TEXT NOT NULL UNIQUE,
+        first_user_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open'
+    );
+    CREATE INDEX IF NOT EXISTS idx_game_requests_status ON game_requests(status);
+    CREATE TABLE IF NOT EXISTS game_request_votes (
+        request_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        vote INTEGER NOT NULL CHECK(vote IN (-1, 1)),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(request_id, user_id),
+        FOREIGN KEY(request_id) REFERENCES game_requests(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS random_game_cooldowns (
+        user_id INTEGER PRIMARY KEY,
+        last_used REAL NOT NULL
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+_orders_init_db()
+
+def _normalize_game_name(name: str) -> str:
+    # Нормализация нужна, чтобы Minecraft / minecraft /  Minecraft  не создавали дубли.
+    return " ".join(name.casefold().split())
+
+def _menu_keyboard() -> ReplyKeyboardMarkup:
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, row_width=2)
+    markup.add(
+        KeyboardButton("📝 Заказать игру"),
+        KeyboardButton("📋 Стол заказов"),
+        KeyboardButton("🎲 Рандомная игра"),
+        KeyboardButton("👤 Профиль"),
+    )
+    return markup
+
+def _send_main_menu(chat_id: int, text: str | None = None) -> None:
+    bot.send_message(chat_id, text or "🎮 <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇", reply_markup=_menu_keyboard())
+
+def _order_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    conn = _orders_db()
+    row = conn.execute("""
+        SELECT
+            COALESCE(SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END),0) likes,
+            COALESCE(SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END),0) dislikes
+        FROM game_request_votes WHERE request_id=?
+    """, (request_id,)).fetchone()
+    conn.close()
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(f"👍 Хочу {int(row['likes'])}", callback_data=f"order_vote:+:{request_id}"),
+        InlineKeyboardButton(f"👎 Не жду {int(row['dislikes'])}", callback_data=f"order_vote:-:{request_id}"),
+    )
+    return markup
+
+def _request_summary(request_id: int) -> str:
+    conn = _orders_db()
+    row = conn.execute("SELECT name,status,created_at FROM game_requests WHERE id=?", (request_id,)).fetchone()
+    votes = conn.execute("""
+        SELECT
+            COALESCE(SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END),0) likes,
+            COALESCE(SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END),0) dislikes,
+            COUNT(*) total
+        FROM game_request_votes WHERE request_id=?
+    """, (request_id,)).fetchone()
+    conn.close()
+    if not row:
+        return "❌ Заказ не найден."
+    status = "🟢 открыт" if row['status'] == 'open' else "✅ добавлена"
+    return (
+        f"🎮 <b>{html.escape(row['name'])}</b>\n"
+        f"{status} · 👥 ждут: <b>{int(votes['total'])}</b>\n"
+        f"👍 <b>{int(votes['likes'])}</b>   👎 <b>{int(votes['dislikes'])}</b>"
+    )
 
 # ── Subscription gate (Двойная проверка подписки на канал И чат) ───────────────
 
@@ -233,25 +332,13 @@ def handle_start(message: Message) -> None:
     key = parts[1].strip() if len(parts) > 1 else None
 
     if not key:
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🎲 Сыграть в кости", callback_data="play_dice"))
-        
-        user_display = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
-        
-        user_display = html.escape(str(user_display))
         welcome_text = (
-            f"👋 <b>Привет! Я Berlions чат-бот.</b>\n\n"
-            f"📋 <b>Доступные команды:</b>\n"
-            f"• /start — приветствие и главное меню\n"
-            f"• /помощь — список доступных команд\n"
-            f"• /поиск <i>запрос</i> — поиск игры или контента\n"
-            f"• /dice — сыграть в кости 🎲\n• /profile — профиль и активность\n• /top — топ активности\n• /топденьги — топ денег\n\n"
-            f"🔍 <b>Поиск:</b>\n"
-            f"Например: <code>/поиск standoff 2</code>\n\n"
-            f"🎲 Нажми кнопку ниже, чтобы сразу сыграть."
+            "👋 <b>Привет! Я Berlions чат-бот.</b>\n\n"
+            "🎮 Здесь можно быстро найти игру, заказать отсутствующую игру "
+            "или получить случайную игру из базы.\n\n"
+            "Нажми на кнопку меню под полем ввода 👇"
         )
-        
-        bot.send_message(message.chat.id, welcome_text, reply_markup=markup)
+        _send_main_menu(message.chat.id, welcome_text)
         return
 
     if not _require_subscription(message.chat.id, message.from_user.id, f"key:{key}"): return
@@ -269,18 +356,226 @@ def handle_start(message: Message) -> None:
 
 @bot.message_handler(commands=["help", "помощь"])
 def handle_help(message: Message) -> None:
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🎲 Сыграть в кости", callback_data="play_dice"))
+    _send_main_menu(message.chat.id,
+        "📚 <b>Меню Berlions</b>\n\n"
+        "📝 Заказать игру — оставить заявку на игру, которой пока нет в базе.\n"
+        "📋 Стол заказов — посмотреть, что чаще всего хотят пользователи.\n"
+        "🎲 Рандомная игра — случайная игра из базы, раз в 30 минут.\n"
+        "👤 Профиль — твой профиль, активность и награды.\n\n"
+        "Команды по-прежнему работают, но вводить их вручную необязательно.")
+
+
+# ── Главная клавиатура / меню ────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "📝 Заказать игру"), content_types=["text"])
+def handle_menu_order(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "order"):
+        return
+    _order_pending[message.from_user.id] = message.chat.id
     bot.send_message(
         message.chat.id,
-        "📋 <b>Доступные команды:</b>\n\n"
-        "• /start — главное меню\n"
-        "• /помощь — список доступных команд\n"
-        "• /поиск <i>запрос</i> — поиск контента\n"
-        "• /кости — сыграть в кости 🎲\n\n"
-        "Пример поиска: <code>/поиск minecraft</code>",
-        reply_markup=markup,
+        "📝 <b>Заказ игры</b>\n\n"
+        "Напиши название игры, которую хочешь увидеть в базе.\n"
+        "Можно написать не идеально — например <i>rdr2</i>, <i>Red Dead 2</i> или полное название.\n\n"
+        "Если такая заявка уже есть, новая копия не создастся — ты просто добавишь свой голос.\n\n"
+        "❌ Чтобы отменить, напиши <code>отмена</code>.",
     )
+
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "📋 Стол заказов"), content_types=["text"])
+def handle_menu_orders(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "orders"):
+        return
+    _send_orders_list(message.chat.id, page=0)
+
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "🎲 Рандомная игра"), content_types=["text"])
+def handle_menu_random_game(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "random_game"):
+        return
+    _play_random_game(message)
+
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "👤 Профиль"), content_types=["text"])
+def handle_menu_profile(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "profile"):
+        return
+    handle_social_profile(message)
+
+
+@bot.message_handler(func=lambda m: bool(
+    m.chat.type == "private" and m.text and m.from_user and
+    _order_pending.get(m.from_user.id) == m.chat.id and
+    m.text.strip().lower() == "отмена"
+), content_types=["text"])
+def handle_order_cancel(message: Message) -> None:
+    _order_pending.pop(message.from_user.id, None)
+    bot.send_message(message.chat.id, "❌ <b>Заказ отменён.</b>")
+
+
+@bot.message_handler(func=lambda m: bool(
+    m.chat.type == "private" and m.text and m.from_user and
+    _order_pending.get(m.from_user.id) == m.chat.id
+), content_types=["text"])
+def handle_order_text(message: Message) -> None:
+    user_id = message.from_user.id
+    chat_id = _order_pending.pop(user_id)
+    name = " ".join(message.text.strip().split())
+    if len(name) < 2:
+        bot.send_message(chat_id, "⚠️ Название слишком короткое. Напиши нормальное название игры.")
+        _order_pending[user_id] = chat_id
+        return
+    if len(name) > 100:
+        bot.send_message(chat_id, "⚠️ Название слишком длинное. До 100 символов, пожалуйста.")
+        _order_pending[user_id] = chat_id
+        return
+    key = _normalize_game_name(name)
+    conn = _orders_db()
+    now = datetime.now().isoformat(timespec="seconds")
+    row = conn.execute("SELECT * FROM game_requests WHERE name_key=?", (key,)).fetchone()
+    if row and row['status'] == 'open':
+        request_id = int(row['id'])
+        conn.execute("UPDATE game_requests SET updated_at=? WHERE id=?", (now, request_id))
+        created = False
+    elif row:
+        request_id = int(row['id'])
+        conn.execute("UPDATE game_requests SET name=?,updated_at=?,status='open' WHERE id=?", (name, now, request_id))
+        created = False
+    else:
+        cur = conn.execute("INSERT INTO game_requests(name,name_key,first_user_id,created_at,updated_at,status) VALUES(?,?,?,?,?,'open')", (name,key,user_id,now,now))
+        request_id = int(cur.lastrowid)
+        created = True
+    conn.execute("INSERT INTO game_request_votes(request_id,user_id,vote,updated_at) VALUES(?,?,1,?) ON CONFLICT(request_id,user_id) DO UPDATE SET vote=1,updated_at=excluded.updated_at", (request_id,user_id,now))
+    conn.commit()
+    conn.close()
+    if created:
+        bot.send_message(chat_id, f"✅ <b>Заявка добавлена!</b>\n\n{_request_summary(request_id)}\n\nЕсли игра нужна — жми 👍, если нет — 👎.", reply_markup=_order_keyboard(request_id))
+        # Уведомляем всех админов, чтобы они видели спрос даже если не открывают стол.
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(admin_id, f"📥 <b>Новый заказ игры</b>\n\n{_request_summary(request_id)}\n\n👤 От: {_social_user_label(chat_id,user_id)}", reply_markup=_order_keyboard(request_id))
+            except Exception as exc:
+                logger.warning("Order admin notification failed for %s: %s", admin_id, exc)
+    else:
+        bot.send_message(chat_id, f"👍 <b>Твой голос добавлен к уже существующей заявке.</b>\n\n{_request_summary(request_id)}", reply_markup=_order_keyboard(request_id))
+
+
+@bot.message_handler(commands=["dice", "кости"])
+def handle_dice_command(message: Message) -> None:
+    user_id = message.from_user.id
+    now = time.time()
+    last_roll = _dice_cooldown.get(user_id, 0)
+    if now - last_roll < 60:
+        bot.send_message(message.chat.id, f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!")
+        return
+    if not _require_subscription(message.chat.id, user_id, "dice"):
+        return
+    _dice_cooldown[user_id] = now
+    try:
+        sent = bot.send_dice(message.chat.id, emoji="🎲")
+        value = getattr(sent.dice, "value", None)
+        if value is not None:
+            bot.send_message(message.chat.id, f"🎲 Выпало: <b>{value}</b>")
+    except Exception:
+        logger.exception("Dice error")
+        bot.send_message(message.chat.id, "❌ Не удалось бросить кости. Попробуй ещё раз.")
+
+
+def _edit_orders_list(chat_id: int, message_id: int, page: int = 0, page_size: int = 8) -> None:
+    conn = _orders_db()
+    total = int(conn.execute("SELECT COUNT(*) n FROM game_requests WHERE status='open'").fetchone()["n"])
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    rows = conn.execute("""
+        SELECT r.id,r.name,
+               COALESCE(SUM(CASE WHEN v.vote=1 THEN 1 ELSE 0 END),0) likes,
+               COALESCE(SUM(CASE WHEN v.vote=-1 THEN 1 ELSE 0 END),0) dislikes,
+               COUNT(v.user_id) voters
+        FROM game_requests r LEFT JOIN game_request_votes v ON v.request_id=r.id
+        WHERE r.status='open' GROUP BY r.id
+        ORDER BY (likes-dislikes) DESC,voters DESC,r.updated_at DESC LIMIT ? OFFSET ?
+    """, (page_size,page*page_size)).fetchall()
+    conn.close()
+    if not rows:
+        bot.edit_message_text("📋 <b>Стол заказов пуст.</b>", chat_id, message_id)
+        return
+    lines=[f"📋 <b>СТОЛ ЗАКАЗОВ</b> · {total} заявок","","Самые востребованные игры сверху 👇",""]
+    for i,r in enumerate(rows,page*page_size+1):
+        lines.append(f"<b>{i}. 🎮 {html.escape(r['name'])}</b>\n   👥 {int(r['voters'])} · 👍 {int(r['likes'])} · 👎 {int(r['dislikes'])}")
+    markup=InlineKeyboardMarkup(row_width=1)
+    for r in rows: markup.add(InlineKeyboardButton(f"🎮 {str(r['name'])[:45]}",callback_data=f"order_open:{int(r['id'])}"))
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("⬅️",callback_data=f"orders_page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="orders_noop"))
+    if page<pages-1: nav.append(InlineKeyboardButton("➡️",callback_data=f"orders_page:{page+1}"))
+    markup.row(*nav)
+    bot.edit_message_text("\n".join(lines),chat_id,message_id,reply_markup=markup)
+
+
+def _send_orders_list(chat_id: int, page: int = 0, page_size: int = 8) -> None:
+    conn = _orders_db()
+    total = int(conn.execute("SELECT COUNT(*) n FROM game_requests WHERE status='open'").fetchone()["n"])
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    rows = conn.execute("""
+        SELECT r.id,r.name,r.status,
+               COALESCE(SUM(CASE WHEN v.vote=1 THEN 1 ELSE 0 END),0) likes,
+               COALESCE(SUM(CASE WHEN v.vote=-1 THEN 1 ELSE 0 END),0) dislikes,
+               COUNT(v.user_id) voters
+        FROM game_requests r LEFT JOIN game_request_votes v ON v.request_id=r.id
+        WHERE r.status='open'
+        GROUP BY r.id
+        ORDER BY (likes - dislikes) DESC, voters DESC, r.updated_at DESC
+        LIMIT ? OFFSET ?
+    """, (page_size, page * page_size)).fetchall()
+    conn.close()
+    if not rows:
+        bot.send_message(chat_id, "📋 <b>Стол заказов пуст.</b>\n\nПока никто ничего не заказал.")
+        return
+    lines = [f"📋 <b>СТОЛ ЗАКАЗОВ</b> · {total} заявок", "", "Самые востребованные игры сверху 👇", ""]
+    for i, r in enumerate(rows, page * page_size + 1):
+        lines.append(f"<b>{i}. 🎮 {html.escape(r['name'])}</b>\n   👥 {int(r['voters'])} · 👍 {int(r['likes'])} · 👎 {int(r['dislikes'])}")
+    markup = InlineKeyboardMarkup(row_width=1)
+    for r in rows:
+        markup.add(InlineKeyboardButton(f"🎮 {str(r['name'])[:45]}", callback_data=f"order_open:{int(r['id'])}"))
+    nav=[]
+    if page > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"orders_page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="orders_noop"))
+    if page < pages - 1: nav.append(InlineKeyboardButton("➡️", callback_data=f"orders_page:{page+1}"))
+    markup.row(*nav)
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
+
+
+def _play_random_game(message: Message) -> None:
+    user_id = message.from_user.id
+    now = time.time()
+    conn = _orders_db()
+    row = conn.execute("SELECT last_used FROM random_game_cooldowns WHERE user_id=?", (user_id,)).fetchone()
+    if row:
+        remaining = RANDOM_GAME_COOLDOWN - (now - float(row['last_used']))
+        if remaining > 0:
+            mins = int(remaining // 60)
+            secs = int(remaining % 60)
+            conn.close()
+            bot.send_message(message.chat.id, f"⏳ <b>Рандом уже использован.</b>\nПопробуй снова через <b>{mins} мин. {secs:02d} сек.</b>")
+            return
+    # Получаем список существующих игр из основной БД. Это сохраняет совместимость со старой базой.
+    rows = database.list_links()
+    if not rows:
+        conn.close()
+        bot.send_message(message.chat.id, "📭 В базе пока нет игр для рандома.")
+        return
+    chosen = random.choice(rows)
+    conn.execute("INSERT INTO random_game_cooldowns(user_id,last_used) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_used=excluded.last_used", (user_id, now))
+    conn.commit()
+    conn.close()
+    bot.send_message(message.chat.id, f"🎲 <b>Тебе выпала случайная игра!</b>\n\n🎮 <b>{html.escape(str(chosen['content_text']))}</b>")
+    try:
+        _deliver_link(message.chat.id, chosen)
+    except Exception:
+        logger.exception("Random game delivery failed")
+        bot.send_message(message.chat.id, "⚠️ Игра выбрана, но файл не удалось отправить. Администратору стоит проверить эту запись.")
+
 
 # ── /search (С анимацией и умным поиском) ─────────────────────────────────────
 
@@ -372,7 +667,6 @@ def handle_search(message: Message) -> None:
 # ── BERLIONS MONEY SYSTEM ─────────────────────────────────────────────────────
 # Отдельная система игровой валюты.
 
-import sqlite3
 from datetime import datetime
 
 MONEY_DB = "money.db"
@@ -1234,7 +1528,8 @@ def handle_social_commands(message: Message) -> None:
         "• <code>/работа</code> — заработать раз в 30 минут\n"
         "• <code>/топденьги</code> — топ игроков по деньгам\n\n"
         "🎲 <code>/кости</code> — кости\n"
-        "🔎 <code>/поиск запрос</code> — поиск"
+        "🔎 <code>/поиск запрос</code> — поиск\n\n"
+        "💡 Основные функции доступны через меню-кнопки под полем ввода."
     )
     bot.send_message(message.chat.id,text)
 
@@ -1448,6 +1743,127 @@ def handle_social_marry_command(message: Message) -> None:
     proposal_id=cur.lastrowid; conn.commit(); conn.close()
     markup=InlineKeyboardMarkup(row_width=2).add(InlineKeyboardButton("💍 Согласиться",callback_data=f"marry_yes:{proposal_id}"),InlineKeyboardButton("❌ Отказаться",callback_data=f"marry_no:{proposal_id}"))
     bot.send_message(message.chat.id,f"💍 {_social_user_label(message.chat.id,message.from_user.id)} предлагает брак {_social_user_label(message.chat.id,target)}!\n\nСогласие второго пользователя обязательно.",reply_markup=markup)
+
+
+def _play_dice_legacy(chat_id: int, user_id: int) -> None:
+    now = time.time()
+    last_roll = _dice_cooldown.get(user_id, 0)
+    if now - last_roll < 60:
+        bot.send_message(chat_id, f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!")
+        return
+    if not _require_subscription(chat_id, user_id, "dice"):
+        return
+    _dice_cooldown[user_id] = now
+    try:
+        sent = bot.send_dice(chat_id, emoji="🎲")
+        value = getattr(sent.dice, "value", None)
+        if value is not None:
+            bot.send_message(chat_id, f"🎲 Выпало: <b>{value}</b>")
+    except Exception:
+        logger.exception("Dice callback error")
+        bot.send_message(chat_id, "❌ Не удалось бросить кости. Попробуй ещё раз.")
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and (
+    call.data.startswith("verify:") or call.data.startswith("search_pick:") or call.data == "play_dice" or
+    call.data.startswith("order_vote:") or call.data.startswith("order_open:") or call.data.startswith("orders_page:") or
+    call.data.startswith("order_close:") or call.data == "orders_noop" or call.data.startswith("marry_yes:") or call.data.startswith("marry_no:")
+)))
+def handle_bot_callbacks(call: CallbackQuery) -> None:
+    try:
+        data = call.data or ""
+        if data.startswith("verify:"):
+            context = data[len("verify:"):]
+            if not _is_subscribed(call.from_user.id):
+                bot.answer_callback_query(call.id, "❌ Сначала подпишись на канал и чат.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception: pass
+            if context == "dice":
+                _play_dice_legacy(call.message.chat.id, call.from_user.id)
+            elif context.startswith("key:"):
+                row = database.get_link(context[len("key:"):])
+                if row: _deliver_link(call.message.chat.id, row)
+                else: bot.send_message(call.message.chat.id, "❌ Ссылка не найдена.")
+            return
+        if data.startswith("search_pick:"):
+            key = data[len("search_pick:"):]
+            if not _require_subscription(call.message.chat.id, call.from_user.id, "search"):
+                bot.answer_callback_query(call.id, "🔒 Нужна подписка.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id)
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception: pass
+            row = database.get_link(key)
+            if row: _deliver_link(call.message.chat.id, row)
+            else: bot.send_message(call.message.chat.id, "❌ Контент не найден.")
+            return
+        if data == "play_dice":
+            bot.answer_callback_query(call.id)
+            _play_dice_legacy(call.message.chat.id, call.from_user.id)
+            return
+        if data == "orders_noop":
+            bot.answer_callback_query(call.id)
+            return
+        if data.startswith("orders_page:"):
+            page = max(0, int(data.split(":",1)[1]))
+            bot.answer_callback_query(call.id)
+            # Редактируем список, чтобы чат не засорялся.
+            _edit_orders_list(call.message.chat.id, call.message.message_id, page)
+            return
+        if data.startswith("order_open:"):
+            request_id = int(data.split(":",1)[1])
+            bot.answer_callback_query(call.id)
+            detail_markup = _order_keyboard(request_id)
+            if _is_admin(call.from_user.id):
+                detail_markup.add(InlineKeyboardButton("✅ Игра добавлена — закрыть заявку", callback_data=f"order_close:{request_id}"))
+            bot.edit_message_text(_request_summary(request_id) + "\n\nЕсли игра тебе нужна — голосуй:", call.message.chat.id, call.message.message_id, reply_markup=detail_markup)
+            return
+        if data.startswith("order_close:"):
+            if not _is_admin(call.from_user.id):
+                bot.answer_callback_query(call.id, "⛔ Только администратор.", show_alert=True)
+                return
+            request_id = int(data.split(":",1)[1])
+            conn = _orders_db()
+            conn.execute("UPDATE game_requests SET status='closed',updated_at=? WHERE id=?", (datetime.now().isoformat(timespec="seconds"), request_id))
+            conn.commit(); conn.close()
+            bot.answer_callback_query(call.id, "✅ Заявка закрыта.")
+            _edit_orders_list(call.message.chat.id, call.message.message_id, 0)
+            return
+        if data.startswith("order_vote:"):
+            _, sign, raw_id = data.split(":",2)
+            request_id = int(raw_id)
+            vote = 1 if sign == "+" else -1
+            conn = _orders_db()
+            exists = conn.execute("SELECT id FROM game_requests WHERE id=? AND status='open'", (request_id,)).fetchone()
+            if not exists:
+                conn.close(); bot.answer_callback_query(call.id, "Заявка уже закрыта.", show_alert=True); return
+            now = datetime.now().isoformat(timespec="seconds")
+            old = conn.execute("SELECT vote FROM game_request_votes WHERE request_id=? AND user_id=?", (request_id, call.from_user.id)).fetchone()
+            if old and int(old['vote']) == vote:
+                conn.execute("DELETE FROM game_request_votes WHERE request_id=? AND user_id=?", (request_id, call.from_user.id))
+                message = "Голос убран."
+            else:
+                conn.execute("INSERT INTO game_request_votes(request_id,user_id,vote,updated_at) VALUES(?,?,?,?) ON CONFLICT(request_id,user_id) DO UPDATE SET vote=excluded.vote,updated_at=excluded.updated_at", (request_id,call.from_user.id,vote,now))
+                message = "👍 Учтено!" if vote == 1 else "👎 Учтено!"
+            conn.commit(); conn.close()
+            bot.answer_callback_query(call.id, message)
+            try:
+                refresh_markup = _order_keyboard(request_id)
+                if _is_admin(call.from_user.id):
+                    refresh_markup.add(InlineKeyboardButton("✅ Игра добавлена — закрыть заявку", callback_data=f"order_close:{request_id}"))
+                bot.edit_message_text(_request_summary(request_id) + "\n\nЕсли игра тебе нужна — голосуй:", call.message.chat.id, call.message.message_id, reply_markup=refresh_markup)
+            except Exception:
+                pass
+            return
+        if data.startswith("marry_yes:") or data.startswith("marry_no:"):
+            handle_social_marriage_callback(call)
+            return
+    except Exception:
+        logger.exception("Bot callback error")
+        try: bot.answer_callback_query(call.id, "❌ Ошибка. Попробуй ещё раз.", show_alert=True)
+        except Exception: pass
 
 
 def handle_social_marriage_callback(call: CallbackQuery) -> None:
