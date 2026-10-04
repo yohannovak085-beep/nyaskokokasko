@@ -28,6 +28,7 @@ from telebot.types import (
     Message,
     CallbackQuery,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     KeyboardButton,
 )
 from telebot.apihelper import ApiTelegramException
@@ -240,8 +241,23 @@ def _send_most_wanted(chat_id: int) -> None:
 
     bot.send_message(chat_id, "\n".join(lines))
 
-def _send_main_menu(chat_id: int, text: str | None = None) -> None:
-    bot.send_message(chat_id, text or f"{_pe('game', '🎮')} <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇", reply_markup=_menu_keyboard())
+def _send_main_menu(chat_id: int, text: str | None = None, private_only: bool = True) -> None:
+    # Главная Reply-клавиатура Berlions должна существовать ТОЛЬКО в личке с ботом.
+    # В группе Telegram может сохранить ранее отправленную клавиатуру, поэтому
+    # при вызове из группы явно отправляем ReplyKeyboardRemove.
+    if not private_only:
+        bot.send_message(
+            chat_id,
+            text or "ℹ️ Главное меню доступно только в личных сообщениях с ботом.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    bot.send_message(
+        chat_id,
+        text or f"{_pe('game', '🎮')} <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇",
+        reply_markup=_menu_keyboard(),
+    )
 
 def _order_keyboard(request_id: int) -> InlineKeyboardMarkup:
     conn = _orders_db()
@@ -466,7 +482,11 @@ def handle_start(message: Message) -> None:
             "или получить случайную игру из базы.\n\n"
             "Нажми на кнопку меню под полем ввода 👇"
         )
-        _send_main_menu(message.chat.id, welcome_text)
+        _send_main_menu(
+            message.chat.id,
+            welcome_text,
+            private_only=(message.chat.type == "private"),
+        )
         return
 
     if not _require_subscription(message.chat.id, message.from_user.id, f"key:{key}"): return
@@ -484,13 +504,16 @@ def handle_start(message: Message) -> None:
 
 @bot.message_handler(commands=["help", "помощь"])
 def handle_help(message: Message) -> None:
-    _send_main_menu(message.chat.id,
+    _send_main_menu(
+        message.chat.id,
         "📚 <b>Меню Berlions</b>\n\n"
         "📝 Заказать игру — оставить заявку на игру, которой пока нет в базе.\n"
         "📋 Стол заказов — посмотреть, что чаще всего хотят пользователи.\n"
         "🎲 Рандомная игра — случайная игра из базы, раз в 30 минут.\n"
         "👤 Профиль — твой профиль, активность и награды.\n\n"
-        "Команды по-прежнему работают, но вводить их вручную необязательно.")
+        "Команды по-прежнему работают, но вводить их вручную необязательно.",
+        private_only=(message.chat.type == "private"),
+    )
 
 
 # ── Главная клавиатура / меню ────────────────────────────────────────────────
