@@ -71,7 +71,54 @@ logger.info("Admin IDs: %s", ADMIN_IDS)
 telebot.apihelper.ENABLE_MIDDLEWARE = True
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-database.init_db()
+
+# ── Telegram Premium / Custom Emoji ───────────────────────────────────────────
+# ID берём из реальных сообщений Telegram, поэтому здесь НЕТ выдуманных ID.
+# После получения ID достаточно заполнить словарь ниже — весь бот использует
+# единый слой и не требует переписывать десятки сообщений вручную.
+PREMIUM_EMOJI_IDS: dict[str, str] = {
+    # Примеры ключей:
+    # "love": "1234567890123456789",
+    # "hug": "1234567890123456789",
+    # "kiss": "1234567890123456789",
+    # "food": "1234567890123456789",
+    # "drink": "1234567890123456789",
+    # "game": "1234567890123456789",
+    # "money": "1234567890123456789",
+    # "profile": "1234567890123456789",
+    # "award": "1234567890123456789",
+    # "clan": "1234567890123456789",
+    # "marriage": "1234567890123456789",
+    # "search": "1234567890123456789",
+    # "wanted": "1234567890123456789",
+}
+
+def _pe(key: str, fallback: str) -> str:
+    """Возвращает Telegram Custom Emoji, а при отсутствии ID — обычный emoji."""
+    emoji_id = str(PREMIUM_EMOJI_IDS.get(key, "") or "").strip()
+    if not emoji_id.isdigit():
+        return fallback
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+def _extract_custom_emoji_ids(message: Message) -> list[tuple[str, str]]:
+    """Достаёт (альтернативный emoji, custom_emoji_id) из текста сообщения."""
+    found = []
+    entities = list(message.entities or [])
+    for entity in entities:
+        if getattr(entity, "type", None) != "custom_emoji":
+            continue
+        cid = getattr(entity, "custom_emoji_id", None)
+        if not cid:
+            continue
+        # get_entity_text учитывает UTF-16 offsets, в отличие от простого среза Python.
+        try:
+            raw = message.text or ""
+            value = raw[entity.offset: entity.offset + entity.length]
+        except Exception:
+            value = "🧩"
+        found.append((value or "🧩", str(cid)))
+    return found
+
 
 # ── In-memory conversation state ──────────────────────────────────────────────
 
@@ -197,7 +244,7 @@ def _send_most_wanted(chat_id: int) -> None:
     bot.send_message(chat_id, "\n".join(lines))
 
 def _send_main_menu(chat_id: int, text: str | None = None) -> None:
-    bot.send_message(chat_id, text or "🎮 <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇", reply_markup=_menu_keyboard())
+    bot.send_message(chat_id, text or f"{_pe('game', '🎮')} <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇", reply_markup=_menu_keyboard())
 
 def _order_keyboard(request_id: int) -> InlineKeyboardMarkup:
     conn = _orders_db()
@@ -377,6 +424,29 @@ def _bot_username() -> str:
 
 def _deep_link(key: str) -> str:
     return f"https://t.me/{_bot_username()}?start={key}"
+
+# ── Инструмент для получения Custom Emoji ID ──────────────────────────────────
+@bot.message_handler(commands=["emojiid", "эмодзиid"])
+def handle_emoji_id(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ Эта техническая команда доступна только администратору.")
+        return
+
+    source = message.reply_to_message if message.reply_to_message else message
+    found = _extract_custom_emoji_ids(source)
+    if not found:
+        bot.send_message(
+            message.chat.id,
+            "🧩 <b>Custom Emoji ID не найден.</b>\n\n"
+            "Отправь нужный Premium-эмодзи отдельным сообщением, "
+            "ответь на него командой <code>/emojiid</code> и я покажу точный ID.",
+        )
+        return
+
+    lines = ["🧩 <b>Custom Emoji ID</b>", ""]
+    for alt, cid in found:
+        lines.append(f"{alt} → <code>{html.escape(cid)}</code>")
+    bot.send_message(message.chat.id, "\n".join(lines))
 
 # ── /start (С новым приветствием) ─────────────────────────────────────────────
 
@@ -1575,7 +1645,7 @@ def handle_social_top_period_command(message: Message) -> None:
 @bot.message_handler(commands=["commands", "команды"])
 def handle_social_commands(message: Message) -> None:
     text=(
-        "📚 <b>Команды Berlions</b>\n\n"
+        "📚 <b>Команды Berlions</b> ✨\n\n"
         "👤 <b>Профиль</b>\n"
         "• <code>/профиль</code> — профиль и статистика\n"
         "• <code>/награды</code> — награды\n"
@@ -1590,12 +1660,17 @@ def handle_social_commands(message: Message) -> None:
         "• <code>/мой_клан</code> — управление своим кланом\n"
         "• <code>/кик_из_клана @user</code> — исключить участника (владелец)\n"
         "• <code>/удалить_клан</code> — удалить свой клан\n\n"
-        "😘 <b>Общение</b>\n"
-        "• <code>поцеловать @user</code> — действие, можно ответом и с репликой\n"
+        "💗 <b>Ролевые действия</b>\n"
+        "• <code>поцеловать @user</code> — можно ответом на сообщение\n"
         "• <code>обнять @user</code>\n"
         "• <code>дай пять @user</code>\n"
         "• <code>погладить @user</code>\n"
-        "• <code>пожать руку @user</code>\n\n"
+        "• <code>пожать руку @user</code>\n"
+        "• <code>напоить @user</code>\n"
+        "• <code>накормить @user</code> / <code>покормить @user</code>\n"
+        "• <code>позвать на ужин @user</code>\n"
+        "• <code>засосать @user</code>\n"
+        "• <code>ударить @user</code>\n\n"
         "🏆 <b>Активность</b>\n"
         "• <code>топ</code> — общий топ и все сообщения чата\n"
         "• <code>топ дня</code>\n"
@@ -1967,30 +2042,85 @@ def handle_social_marriage_callback(call: CallbackQuery) -> None:
         except Exception: pass
 
 
-@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^(поцеловать|обнять|дай пять|дать пять|погладить|пожать руку)\b",m.text.strip(),re.I)), content_types=["text"])
+@bot.message_handler(
+    func=lambda m: bool(
+        m.text and re.match(
+            r"^(поцеловать|обнять|дай пять|дать пять|погладить|пожать руку|"
+            r"напоить|накормить|покормить|позвать на ужин|засосать|ударить)\b",
+            m.text.strip(),
+            re.I,
+        )
+    ),
+    content_types=["text"],
+)
 def handle_social_roleplay(message: Message) -> None:
-    raw=message.text.strip()
-    parts=raw.split(maxsplit=1)
-    action=parts[0].lower()
-    rest=parts[1].strip() if len(parts)>1 else ""
-    target=_social_target(message,rest)
-    # Для reply команда может содержать реплику без username.
-    quote=""
+    raw = message.text.strip()
+    parts = raw.split(maxsplit=1)
+    action = parts[0].lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    # Многословная команда.
+    if action == "позвать" and rest.lower().startswith("на ужин"):
+        action = "позвать на ужин"
+        rest = rest[len("на ужин"):].strip()
+
+    target = _social_target(message, rest)
+
+    quote = ""
     if message.reply_to_message and rest:
-        quote=rest
+        quote = rest
     elif target and rest:
-        tokens=rest.split(maxsplit=1)
-        quote=tokens[1] if len(tokens)>1 else ""
+        tokens = rest.split(maxsplit=1)
+        quote = tokens[1] if len(tokens) > 1 else ""
+
     if not target:
-        bot.send_message(message.chat.id,f"💫 Формат: <code>{html.escape(action)} @user</code> или ответом на сообщение."); return
-    actor=_social_user_label(message.chat.id,message.from_user.id)
-    target_label=_social_user_label(message.chat.id,target)
-    verbs={"поцеловать":"поцеловал","обнять":"обнял","дай пять":"дал пять","дать пять":"дал пять","погладить":"погладил","пожать руку":"пожал руку"}
-    emoji={"поцеловать":"😘","обнять":"🤗","дай пять":"🖐","дать пять":"🖐","погладить":"🥰","пожать руку":"🤝"}
-    text=f"{emoji[action]} | {actor} <b>{verbs[action]}</b> {target_label}"
+        bot.send_message(
+            message.chat.id,
+            f"{_pe('social', '💫')} <b>Формат:</b> "
+            f"<code>{html.escape(action)} @user</code> или ответом на сообщение.",
+        )
+        return
+
+    if target == message.from_user.id:
+        bot.send_message(message.chat.id, f"{_pe('social', '😄')} На себя это действие не распространяется.")
+        return
+
+    actor = _social_user_label(message.chat.id, message.from_user.id)
+    target_label = _social_user_label(message.chat.id, target)
+
+    verbs = {
+        "поцеловать": "поцеловал",
+        "обнять": "обнял",
+        "дай пять": "дал пять",
+        "дать пять": "дал пять",
+        "погладить": "погладил",
+        "пожать руку": "пожал руку",
+        "напоить": "угостил напитком",
+        "накормить": "накормил",
+        "покормить": "покормил",
+        "позвать на ужин": "позвал на ужин",
+        "засосать": "страстно поцеловал",
+        "ударить": "легонько ударил",
+    }
+    emoji_keys = {
+        "поцеловать": ("kiss", "😘"),
+        "обнять": ("hug", "🤗"),
+        "дай пять": ("highfive", "🖐️"),
+        "дать пять": ("highfive", "🖐️"),
+        "погладить": ("love", "🥰"),
+        "пожать руку": ("handshake", "🤝"),
+        "напоить": ("drink", "🥤"),
+        "накормить": ("food", "🍽️"),
+        "покормить": ("food", "🍽️"),
+        "позвать на ужин": ("dinner", "🍷"),
+        "засосать": ("kiss", "💋"),
+        "ударить": ("hit", "👊"),
+    }
+    emoji_key, fallback = emoji_keys[action]
+    text = f"{_pe(emoji_key, fallback)} | {actor} <b>{verbs[action]}</b> {target_label}"
     if quote:
         text += f"\nс репликой: <i>{html.escape(quote)}</i>"
-    bot.send_message(message.chat.id,text)
+    bot.send_message(message.chat.id, text)
 
 
 # Последний обработчик сообщений: собирает активность, не перехватывая уже обработанные команды.
