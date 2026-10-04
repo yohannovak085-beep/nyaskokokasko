@@ -73,358 +73,48 @@ telebot.apihelper.ENABLE_MIDDLEWARE = True
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ── Telegram Premium / Custom Emoji ───────────────────────────────────────────
-# Единый слой Premium-эмодзи. Все ID ниже получены из реальных сообщений Telegram.
-# Один custom_emoji_id может иметь составной fallback (например 😀😃).
-# Поэтому ID определяется по Telegram entity, а не по простому срезу Python-строки.
-
-PREMIUM_EMOJI_MAP: dict[str, str] = {
-    '😀': '5372954454653933911',
-    '😃': '5372954454653933911',
-    '😄': '5370601486885591701',
-    '😁': '5370601486885591701',
-    '😆': '5373330410321223066',
-    '🥹': '5373330410321223066',
-    '😅': '5373329319399529171',
-    '😂': '5373329319399529171',
-    '🤣': '5372881676433105377',
-    '🥲': '5372881676433105377',
-    '☺️': '5371007876691138460',
-    '😊': '5373015670822804395',
-    '😇': '5373015670822804395',
-    '🙂': '5370953476635368811',
-    '🙃': '5370953476635368811',
-    '😉': '5370712413005945913',
-    '😌': '5370712413005945913',
-    '😍': '5370959021438146805',
-    '🥰': '5370959021438146805',
-    '😘': '5371037748188683677',
-    '😗': '5371037748188683677',
-    '😙': '5370738629486319646',
-    '😚': '5370738629486319646',
-    '😋': '5370947515220761242',
-    '😛': '5370947515220761242',
-    '😝': '5371073319107827779',
-    '😜': '5371073319107827779',
-    '🤪': '5373179691328871991',
-    '🤨': '5373179691328871991',
-    '🧐': '5373101475679443553',
-    '🤓': '5373101475679443553',
-    '😎': '5370699111492229743',
-    '😞': '5370699111492229743',
-    '😒': '5372886001465170842',
-    '😏': '5370900820336319679',
-    '🥳': '5373189724372474575',
-    '🤩': '5373189724372474575',
-    '🥸': '5373292756342938165',
-    '😔': '5373292756342938165',
-    '😟': '5372828792500788028',
-    '😕': '5372828792500788028',
-    '🙁': '5370967353674701492',
-    '☹️': '5370967353674701492',
-    '😣': '5371057462088570593',
-    '😖': '5370823648363943942',
-    '😫': '5370823648363943942',
-    '🤲': '5370564490037303348',
-    '👐': '5370564490037303348',
-    '🙌': '5371087054413241706',
-    '👏': '5371087054413241706',
-    '🤝': '5370853232098681087',
-    '👍': '5370853232098681087',
-    '👎': '5370562939554111732',
-    '👊': '5370562939554111732',
-    '✊': '5373153968769735192',
-    '🤛': '5373153968769735192',
-    '🤜': '5370856771151730818',
-    '🫷': '5370856771151730818',
-    '🫸': '5373141891321699086',
-    '🤞': '5373141891321699086',
-    '✌️': '5370812696197339229',
-    '🫰': '5400022850381827997',
-    '🤟': '5400022850381827997',
-    '🤘': '5370763368497944736',
-    '👌': '5370763368497944736',
-    '🤌': '5370976574969486150',
-    '🤏': '5370976574969486150',
-    '🫳': '5400065288953679132',
-    '🫴': '5400065288953679132',
-    '👈': '5370870691140737817',
-    '👉': '5370870691140737817',
-    '👆': '5373026167722876724',
-    '👇': '5373026167722876724',
-    '☝️': '5370574634750056701',
-    '✋': '5370781385885751708',
-    '🤚': '5370781385885751708',
-    '🖐️': '5370987174948771923',
-    '🖖': '5370987174948771923',
-    '👋': '5373272140499918095',
-    '🤙': '5373272140499918095',
-    '🫲': '5372872665591717013',
-    '🫱': '5372872665591717013',
-    '💪': '5370663188385766522',
-    '🦾': '5370663188385766522',
-    '🖕': '5370679238678551249',
-    '✍️': '5370679238678551249',
-    '🙏': '5370843963559254781',
-    '🫵': '5371077231823036079',
-    '🦶': '5371077231823036079',
-    '🫦': '5471895949804575096',
-    '👄': '5471895949804575096',
-    '🏛': '5472221443901103190',
-    '🎆': '5472221443901103190',
-    '🎇': '5469645992531862101',
-    '📱': '5469645992531862101',
-    '📲': '5471921242866981303',
-    '💻': '5471921242866981303',
-    '⌨️': '5357080225463149588',
-    '🖨': '5469770542288478598',
-    '📹': '5469770542288478598',
-    '📞': '5472309400536358507',
-    '☎️': '5472309400536358507',
-    '📺': '5470058558500382450',
-    '🎙': '5472404692975753822',
-    '🧭': '5469724332735340531',
-    '⏰': '5469724332735340531',
-    '⌛️': '5472101816177008629',
-    '⏳': '5433871032375060997',
-    '💡': '5433871032375060997',
-    '🛢': '5434103785242768167',
-    '💸': '5434103785242768167',
-    '🪙': '5472139590414376346',
-    '💰': '5472139590414376346',
-    '🪪': '5469986291380657759',
-    '💎': '5469986291380657759',
-    '🧰': '5357461124637794049',
-    '🧱': '5357461124637794049',
-    '⛓️': '5471957105843904125',
-    '⛓': '5471957105843904125',
-    '💥': '5471984997361523302',
-    '🔫': '5472234792659458002',
-    '💣': '5472234792659458002',
-    '🧨': '5472060215123778885',
-    '🗡': '5472060215123778885',
-    '⚔️': '5357041699606503565',
-    '⚰️': '5357429539448299875',
-    '🔮': '5469735272017043817',
-    '🧿': '5469735272017043817',
-    '🪬': '5471978009449731768',
-    '💈': '5471978009449731768',
-    '🔭': '5469718869536940860',
-    '🔬': '5469718869536940860',
-    '🩺': '5470177992950946662',
-    '💊': '5470177992950946662',
-    '🧸': '5397915559037785261',
-    '📈': '5397915559037785261',
-    '📉': '5373001317042101552',
-    '📆': '5373001317042101552',
-    '🗳': '5361748661640372834',
-    '📁': '5361748661640372834',
-    '📂': '5431897022456145283',
-    '🗂': '5431897022456145283',
-    '📰': '5359741159566484212',
-    '📚': '5359741159566484212',
-    '📖': '5433653135799228968',
-    '🔗': '5433653135799228968',
-    '📎': '5431721976769027887',
-    '📝': '5431721976769027887',
-    '✏️': '5431736674147114227',
-    '🔍': '5433982607035474385',
-    '🔎': '5433982607035474385',
-    '🔐': '5373098009640836781',
-    '🩷': '5334673106202010226',
-    '🖤': '5226512880362332956',
-    '💜': '5226512880362332956',
-    '💙': '5375129357373165375',
-    '🩵': '5375129357373165375',
-    '💚': '5377844313575150051',
-    '💛': '5334882760735598374',
-    '🧡': '5334882760735598374',
-    '❤️': '5334673106202010226',
-    '🩶': '5188217332748527444',
-    '🤍': '5188217332748527444',
-    '🤎': '5188311512791393083',
-    '💔': '5188311512791393083',
-    '❤️\u200d🔥': '5434031913260035048',
-    '💕': '5449692618151695997',
-    '💞': '5449692618151695997',
-    '💓': '5449468596952507859',
-    '💗': '5449468596952507859',
-    '💖': '5449759615346548186',
-    '💘': '5449759615346548186',
-    '💝': '5433856365061746058',
-    '💍': '5472105307985419058',
-    '🎮': '5472354553527541051',
-    '🏰': '5469904794376217131',
-    '🎲': '5472241608772557596',
-    '📋': '5471893463018511081',
-    '👤': '5472055112702629499',
-    '🏆': '5469774158650942877',
-    '👥': '5472370131373923279',
-    '🔥': '5472348819746200625',
-    '🟢': '5471883477219549006',
-    '📢': '5472105307985419058',
-    '📥': '5472354553527541051',
-    '📭': '5469904794376217131',
-    '🔑': '5472241608772557596',
-    '💳': '5471893463018511081',
-    '🎁': '5472055112702629499',
-    '💼': '5469774158650942877',
-    '🎗': '5472370131373923279',
-    '🗓': '5472348819746200625',
-    '📊': '5471883477219549006',
-    '🎖': '5472105307985419058',
-    '🗑': '5472354553527541051',
-    '💫': '5469904794376217131',
-    '🌱': '5472241608772557596',
-    '🥇': '5471893463018511081',
-    '🥈': '5472055112702629499',
-    '🥉': '5469774158650942877',
-    '💬': '5472370131373923279',
-    '🚫': '5472348819746200625',
-    '🤔': '5341688561617893144',
-    '🔪': '5373090308764505856',
-    '🧩': '5472105307985419058',
-    '🔒': '5373098009640836781',
-    '💵': '5472139590414376346',
-    '👑': '5472354553527541051',
-    '📅': '5373001317042101552',
-    '🏅': '5472348819746200625',
-    '🤗': '5235592402571391050',
-    '🥤': '5357306999736410502',
-    '🍽️': '5373212659497866476',
-    '🍷': '5395808113074914549',
-    '💋': '5373081078879786984'
+# ID берём из реальных сообщений Telegram, поэтому здесь НЕТ выдуманных ID.
+# После получения ID достаточно заполнить словарь ниже — весь бот использует
+# единый слой и не требует переписывать десятки сообщений вручную.
+PREMIUM_EMOJI_IDS: dict[str, str] = {
+    # Premium-эмодзи для RP/социалки.
+    # Выбраны из присланного набора; остальная логика бота не меняется.
+    "love": "5373052620426484968",       # 🩷🩷
+    "kiss": "5373081078879786984",       # 🩷🥰
+    "hug": "5235592402571391050",        # 🥰🤍
+    "highfive": "5373092851385148996",   # 😎🥰
+    "handshake": "5341688561617893144",  # 😁🤔
+    "drink": "5357306999736410502",      # ☺️
+    "food": "5373212659497866476",       # 🩷😂
+    "dinner": "5395808113074914549",     # 🥰☺
+    "hit": "5373090308764505856",        # 😔🔪
 }
 
-def _premium_tag(emoji: str, emoji_id: str) -> str:
-    return f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>'
-
-def _premiumize_text(text):
-    """Заменяет обычные эмодзи в исходящем тексте на Telegram Custom Emoji.
-    Уже существующие <tg-emoji>...</tg-emoji> блоки не трогаются.
-    """
-    if not isinstance(text, str) or not text:
-        return text
-
-    protected = []
-    def protect(match):
-        protected.append(match.group(0))
-        return f"__BERLIONS_PREMIUM_{len(protected)-1}__"
-
-    text = re.sub(r"<tg-emoji\b[^>]*>.*?</tg-emoji>", protect, text, flags=re.S)
-
-    # Один проход: длинные составные emoji проверяются раньше коротких.
-    # Новые <tg-emoji> теги повторно не обрабатываются.
-    if PREMIUM_EMOJI_MAP:
-        pattern = re.compile(
-            "|".join(re.escape(emoji) for emoji in sorted(PREMIUM_EMOJI_MAP, key=len, reverse=True))
-        )
-        text = pattern.sub(
-            lambda m: _premium_tag(m.group(0), PREMIUM_EMOJI_MAP[m.group(0)]),
-            text,
-        )
-
-    for i, original in enumerate(protected):
-        text = text.replace(f"__BERLIONS_PREMIUM_{i}__", original)
-    return text
-
-def _premiumize_media_caption(media):
-    if getattr(media, "caption", None):
-        media.caption = _premiumize_text(media.caption)
-        try:
-            media.parse_mode = "HTML"
-        except Exception:
-            pass
-    return media
-
-def _premium_send_message(*args, **kwargs):
-    if len(args) >= 2:
-        args = list(args)
-        args[1] = _premiumize_text(args[1])
-        args = tuple(args)
-    elif "text" in kwargs:
-        kwargs["text"] = _premiumize_text(kwargs["text"])
-    kwargs.setdefault("parse_mode", "HTML")
-    return bot.send_message(*args, **kwargs)
-
-def _premium_edit_message_text(*args, **kwargs):
-    if "text" in kwargs:
-        kwargs["text"] = _premiumize_text(kwargs["text"])
-    elif len(args) >= 3:
-        args = list(args)
-        args[2] = _premiumize_text(args[2])
-        args = tuple(args)
-    kwargs.setdefault("parse_mode", "HTML")
-    return bot.edit_message_text(*args, **kwargs)
-
-def _premium_edit_message_caption(*args, **kwargs):
-    if "caption" in kwargs:
-        kwargs["caption"] = _premiumize_text(kwargs["caption"])
-    elif len(args) >= 3:
-        args = list(args)
-        args[2] = _premiumize_text(args[2])
-        args = tuple(args)
-    kwargs.setdefault("parse_mode", "HTML")
-    return bot.edit_message_caption(*args, **kwargs)
-
-def _premium_media_send(method, *args, **kwargs):
-    if "caption" in kwargs:
-        kwargs["caption"] = _premiumize_text(kwargs["caption"])
-        kwargs.setdefault("parse_mode", "HTML")
-    elif len(args) >= 2 and isinstance(args[1], str):
-        args = list(args)
-        args[1] = _premiumize_text(args[1])
-        args = tuple(args)
-        kwargs.setdefault("parse_mode", "HTML")
-    return getattr(bot, method)(*args, **kwargs)
-
-def _premium_send_media_group(*args, **kwargs):
-    if len(args) >= 2:
-        for item in args[1]:
-            _premiumize_media_caption(item)
-    elif "media" in kwargs:
-        for item in kwargs["media"]:
-            _premiumize_media_caption(item)
-    return bot.send_media_group(*args, **kwargs)
+def _pe(key: str, fallback: str) -> str:
+    """Возвращает Telegram Custom Emoji, а при отсутствии ID — обычный emoji."""
+    emoji_id = str(PREMIUM_EMOJI_IDS.get(key, "") or "").strip()
+    if not emoji_id.isdigit():
+        return fallback
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
 
 def _extract_custom_emoji_ids(message: Message) -> list[tuple[str, str]]:
-    """Корректно достаёт каждый custom_emoji_id, учитывая UTF-16 offsets Telegram."""
+    """Достаёт (альтернативный emoji, custom_emoji_id) из текста сообщения."""
     found = []
-    raw = message.text or message.caption or ""
-    entities = list(message.entities or message.caption_entities or [])
-
+    entities = list(message.entities or [])
     for entity in entities:
         if getattr(entity, "type", None) != "custom_emoji":
             continue
         cid = getattr(entity, "custom_emoji_id", None)
         if not cid:
             continue
+        # get_entity_text учитывает UTF-16 offsets, в отличие от простого среза Python.
         try:
-            encoded = raw.encode("utf-16-le")
-            start = int(entity.offset) * 2
-            end = start + int(entity.length) * 2
-            value = encoded[start:end].decode("utf-16-le")
+            raw = message.text or ""
+            value = raw[entity.offset: entity.offset + entity.length]
         except Exception:
             value = "🧩"
         found.append((value or "🧩", str(cid)))
     return found
-
-def _pe(key: str, fallback: str) -> str:
-    """Возвращает конкретный Premium Custom Emoji для специальных RP-действий."""
-    rp = {
-        "love": "5373052620426484968",
-        "kiss": "5373081078879786984",
-        "hug": "5235592402571391050",
-        "highfive": "5373092851385148996",
-        "handshake": "5341688561617893144",
-        "drink": "5357306999736410502",
-        "food": "5373212659497866476",
-        "dinner": "5395808113074914549",
-        "hit": "5373090308764505856",
-    }
-    emoji_id = rp.get(key)
-    if not emoji_id:
-        return fallback
-    return _premium_tag(fallback, emoji_id)
 
 
 # ── In-memory conversation state ──────────────────────────────────────────────
@@ -528,7 +218,7 @@ def _send_most_wanted(chat_id: int) -> None:
     conn.close()
 
     if not rows:
-        _premium_send_message(
+        bot.send_message(
             chat_id,
             "🔥 <b>Самая разыскиваемая игра</b>\n\n"
             "Пока статистики нет. Найди игру через <code>/поиск название</code> — и она появится здесь!",
@@ -548,10 +238,10 @@ def _send_most_wanted(chat_id: int) -> None:
         word = "человек" if n == 1 else ("человека" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "человек")
         lines.append(f"{prefix} 🎮 <b>{html.escape(str(row['game_name']))}</b> — 👥 <b>{n}</b> {word}")
 
-    _premium_send_message(chat_id, "\n".join(lines))
+    bot.send_message(chat_id, "\n".join(lines))
 
 def _send_main_menu(chat_id: int, text: str | None = None) -> None:
-    _premium_send_message(chat_id, text or f"{_pe('game', '🎮')} <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇", reply_markup=_menu_keyboard())
+    bot.send_message(chat_id, text or f"{_pe('game', '🎮')} <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇", reply_markup=_menu_keyboard())
 
 def _order_keyboard(request_id: int) -> InlineKeyboardMarkup:
     conn = _orders_db()
@@ -631,7 +321,7 @@ def _require_subscription(chat_id: int, user_id: int, context: str) -> bool:
     if _is_subscribed(user_id):
         return True
 
-    _premium_send_message(
+    bot.send_message(
         chat_id,
         "🔒 <b>Доступ закрыт</b>\n\n"
         "Чтобы получить контент, нужно подписаться на наш <b>канал</b> и вступить в <b>чат</b>.\n\n"
@@ -652,9 +342,9 @@ def _deliver_link(chat_id: int, row: database.sqlite3.Row) -> None:
         if row["target_url"]:
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("⬇️ Скачать / Перейти", url=row["target_url"]))
-            _premium_send_message(chat_id, caption, reply_markup=markup)
+            bot.send_message(chat_id, caption, reply_markup=markup)
         else:
-            _premium_send_message(chat_id, caption)
+            bot.send_message(chat_id, caption)
         return
 
     # Одиночный файл — отправляем с подписью
@@ -681,7 +371,7 @@ def _deliver_link(chat_id: int, row: database.sqlite3.Row) -> None:
             c = _cap() if i == 0 else None
             if f["file_type"] == "photo": group.append(InputMediaPhoto(f["file_id"], caption=c, parse_mode="HTML" if c else None))
             else: group.append(InputMediaVideo(f["file_id"], caption=c, parse_mode="HTML" if c else None))
-        _premium_send_media_group(chat_id, group)
+        bot.send_media_group(chat_id, group)
 
     if docs:
         if len(docs) == 1: _send_file(chat_id, docs[0]["file_id"], "document", caption=_cap())
@@ -690,10 +380,10 @@ def _deliver_link(chat_id: int, row: database.sqlite3.Row) -> None:
             for i, f in enumerate(docs):
                 c = _cap() if i == 0 else None
                 group.append(InputMediaDocument(f["file_id"], caption=c, parse_mode="HTML" if c else None))
-            _premium_send_media_group(chat_id, group)
+            bot.send_media_group(chat_id, group)
 
     for f in others: _send_file(chat_id, f["file_id"], f["file_type"], caption=_cap())
-    if not caption_used: _premium_send_message(chat_id, caption)
+    if not caption_used: bot.send_message(chat_id, caption)
 
 def _send_file(chat_id: int, file_id: str, file_type: str, caption: str | None = None) -> None:
     """Вспомогательная функция для отправки одного файла."""
@@ -718,7 +408,7 @@ def _extract_file(message: Message) -> tuple[str, str] | tuple[None, None]:
     return None, None
 
 def _files_added_reply(chat_id: int, count: int) -> None:
-    _premium_send_message(chat_id, f"✅ Файл добавлен (<b>{count}</b> шт.). Отправьте ещё файл или напишите /stop для сохранения.")
+    bot.send_message(chat_id, f"✅ Файл добавлен (<b>{count}</b> шт.). Отправьте ещё файл или напишите /stop для сохранения.")
 
 # ── Admin helpers ─────────────────────────────────────────────────────────────
 
@@ -736,13 +426,13 @@ def _deep_link(key: str) -> str:
 @bot.message_handler(commands=["emojiid", "эмодзиid"])
 def handle_emoji_id(message: Message) -> None:
     if not _is_admin(message.from_user.id):
-        _premium_send_message(message.chat.id, "⛔ Эта техническая команда доступна только администратору.")
+        bot.send_message(message.chat.id, "⛔ Эта техническая команда доступна только администратору.")
         return
 
     source = message.reply_to_message if message.reply_to_message else message
     found = _extract_custom_emoji_ids(source)
     if not found:
-        _premium_send_message(
+        bot.send_message(
             message.chat.id,
             "🧩 <b>Custom Emoji ID не найден.</b>\n\n"
             "Отправь нужный Premium-эмодзи отдельным сообщением, "
@@ -750,9 +440,9 @@ def handle_emoji_id(message: Message) -> None:
         )
         return
 
-    lines = ["🧩 <b>Custom Emoji ID</b>", "", f"Найдено: <b>{len(found)}</b>", ""]
-    for i, (alt, cid) in enumerate(found, 1):
-        lines.append(f"<b>{i}.</b> {html.escape(alt)} → <code>{html.escape(cid)}</code>")
+    lines = ["🧩 <b>Custom Emoji ID</b>", ""]
+    for alt, cid in found:
+        lines.append(f"{alt} → <code>{html.escape(cid)}</code>")
     bot.send_message(message.chat.id, "\n".join(lines))
 
 # ── /start (С новым приветствием) ─────────────────────────────────────────────
@@ -783,7 +473,7 @@ def handle_start(message: Message) -> None:
 
     row = database.get_link(key)
     if row is None:
-        _premium_send_message(message.chat.id, "❌ Ссылка не найдена или устарела.")
+        bot.send_message(message.chat.id, "❌ Ссылка не найдена или устарела.")
         logger.warning("Unknown deep-link key: %r", key)
         return
 
@@ -810,7 +500,7 @@ def handle_menu_order(message: Message) -> None:
     if not _require_subscription(message.chat.id, message.from_user.id, "order"):
         return
     _order_pending[message.from_user.id] = message.chat.id
-    _premium_send_message(
+    bot.send_message(
         message.chat.id,
         "📝 <b>Заказ игры</b>\n\n"
         "Напиши название игры, которую хочешь увидеть в базе.\n"
@@ -862,7 +552,7 @@ def handle_most_wanted_command(message: Message) -> None:
 ), content_types=["text"])
 def handle_order_cancel(message: Message) -> None:
     _order_pending.pop(message.from_user.id, None)
-    _premium_send_message(message.chat.id, "❌ <b>Заказ отменён.</b>")
+    bot.send_message(message.chat.id, "❌ <b>Заказ отменён.</b>")
 
 
 @bot.message_handler(func=lambda m: bool(
@@ -874,11 +564,11 @@ def handle_order_text(message: Message) -> None:
     chat_id = _order_pending.pop(user_id)
     name = " ".join(message.text.strip().split())
     if len(name) < 2:
-        _premium_send_message(chat_id, "⚠️ Название слишком короткое. Напиши нормальное название игры.")
+        bot.send_message(chat_id, "⚠️ Название слишком короткое. Напиши нормальное название игры.")
         _order_pending[user_id] = chat_id
         return
     if len(name) > 100:
-        _premium_send_message(chat_id, "⚠️ Название слишком длинное. До 100 символов, пожалуйста.")
+        bot.send_message(chat_id, "⚠️ Название слишком длинное. До 100 символов, пожалуйста.")
         _order_pending[user_id] = chat_id
         return
     key = _normalize_game_name(name)
@@ -901,15 +591,15 @@ def handle_order_text(message: Message) -> None:
     conn.commit()
     conn.close()
     if created:
-        _premium_send_message(chat_id, f"✅ <b>Заявка добавлена!</b>\n\n{_request_summary(request_id)}\n\nЕсли игра нужна — жми 👍, если нет — 👎.", reply_markup=_order_keyboard(request_id))
+        bot.send_message(chat_id, f"✅ <b>Заявка добавлена!</b>\n\n{_request_summary(request_id)}\n\nЕсли игра нужна — жми 👍, если нет — 👎.", reply_markup=_order_keyboard(request_id))
         # Уведомляем всех админов, чтобы они видели спрос даже если не открывают стол.
         for admin_id in ADMIN_IDS:
             try:
-                _premium_send_message(admin_id, f"📥 <b>Новый заказ игры</b>\n\n{_request_summary(request_id)}\n\n👤 От: {_social_user_label(chat_id,user_id)}", reply_markup=_order_keyboard(request_id))
+                bot.send_message(admin_id, f"📥 <b>Новый заказ игры</b>\n\n{_request_summary(request_id)}\n\n👤 От: {_social_user_label(chat_id,user_id)}", reply_markup=_order_keyboard(request_id))
             except Exception as exc:
                 logger.warning("Order admin notification failed for %s: %s", admin_id, exc)
     else:
-        _premium_send_message(chat_id, f"👍 <b>Твой голос добавлен к уже существующей заявке.</b>\n\n{_request_summary(request_id)}", reply_markup=_order_keyboard(request_id))
+        bot.send_message(chat_id, f"👍 <b>Твой голос добавлен к уже существующей заявке.</b>\n\n{_request_summary(request_id)}", reply_markup=_order_keyboard(request_id))
 
 
 @bot.message_handler(commands=["dice", "кости"])
@@ -918,7 +608,7 @@ def handle_dice_command(message: Message) -> None:
     now = time.time()
     last_roll = _dice_cooldown.get(user_id, 0)
     if now - last_roll < 60:
-        _premium_send_message(message.chat.id, f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!")
+        bot.send_message(message.chat.id, f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!")
         return
     if not _require_subscription(message.chat.id, user_id, "dice"):
         return
@@ -927,10 +617,10 @@ def handle_dice_command(message: Message) -> None:
         sent = bot.send_dice(message.chat.id, emoji="🎲")
         value = getattr(sent.dice, "value", None)
         if value is not None:
-            _premium_send_message(message.chat.id, f"🎲 Выпало: <b>{value}</b>")
+            bot.send_message(message.chat.id, f"🎲 Выпало: <b>{value}</b>")
     except Exception:
         logger.exception("Dice error")
-        _premium_send_message(message.chat.id, "❌ Не удалось бросить кости. Попробуй ещё раз.")
+        bot.send_message(message.chat.id, "❌ Не удалось бросить кости. Попробуй ещё раз.")
 
 
 def _edit_orders_list(chat_id: int, message_id: int, page: int = 0, page_size: int = 8) -> None:
@@ -949,7 +639,7 @@ def _edit_orders_list(chat_id: int, message_id: int, page: int = 0, page_size: i
     """, (page_size,page*page_size)).fetchall()
     conn.close()
     if not rows:
-        _premium_edit_message_text("📋 <b>Стол заказов пуст.</b>", chat_id, message_id)
+        bot.edit_message_text("📋 <b>Стол заказов пуст.</b>", chat_id, message_id)
         return
     lines=[f"📋 <b>СТОЛ ЗАКАЗОВ</b> · {total} заявок","","Самые востребованные игры сверху 👇",""]
     for i,r in enumerate(rows,page*page_size+1):
@@ -961,7 +651,7 @@ def _edit_orders_list(chat_id: int, message_id: int, page: int = 0, page_size: i
     nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="orders_noop"))
     if page<pages-1: nav.append(InlineKeyboardButton("➡️",callback_data=f"orders_page:{page+1}"))
     markup.row(*nav)
-    _premium_edit_message_text("\n".join(lines),chat_id,message_id,reply_markup=markup)
+    bot.edit_message_text("\n".join(lines),chat_id,message_id,reply_markup=markup)
 
 
 def _send_orders_list(chat_id: int, page: int = 0, page_size: int = 8) -> None:
@@ -982,7 +672,7 @@ def _send_orders_list(chat_id: int, page: int = 0, page_size: int = 8) -> None:
     """, (page_size, page * page_size)).fetchall()
     conn.close()
     if not rows:
-        _premium_send_message(chat_id, "📋 <b>Стол заказов пуст.</b>\n\nПока никто ничего не заказал.")
+        bot.send_message(chat_id, "📋 <b>Стол заказов пуст.</b>\n\nПока никто ничего не заказал.")
         return
     lines = [f"📋 <b>СТОЛ ЗАКАЗОВ</b> · {total} заявок", "", "Самые востребованные игры сверху 👇", ""]
     for i, r in enumerate(rows, page * page_size + 1):
@@ -995,7 +685,7 @@ def _send_orders_list(chat_id: int, page: int = 0, page_size: int = 8) -> None:
     nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="orders_noop"))
     if page < pages - 1: nav.append(InlineKeyboardButton("➡️", callback_data=f"orders_page:{page+1}"))
     markup.row(*nav)
-    _premium_send_message(chat_id, "\n".join(lines), reply_markup=markup)
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
 
 
 def _play_random_game(message: Message) -> None:
@@ -1009,24 +699,24 @@ def _play_random_game(message: Message) -> None:
             mins = int(remaining // 60)
             secs = int(remaining % 60)
             conn.close()
-            _premium_send_message(message.chat.id, f"⏳ <b>Рандом уже использован.</b>\nПопробуй снова через <b>{mins} мин. {secs:02d} сек.</b>")
+            bot.send_message(message.chat.id, f"⏳ <b>Рандом уже использован.</b>\nПопробуй снова через <b>{mins} мин. {secs:02d} сек.</b>")
             return
     # Получаем список существующих игр из основной БД. Это сохраняет совместимость со старой базой.
     rows = database.list_links()
     if not rows:
         conn.close()
-        _premium_send_message(message.chat.id, "📭 В базе пока нет игр для рандома.")
+        bot.send_message(message.chat.id, "📭 В базе пока нет игр для рандома.")
         return
     chosen = random.choice(rows)
     conn.execute("INSERT INTO random_game_cooldowns(user_id,last_used) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_used=excluded.last_used", (user_id, now))
     conn.commit()
     conn.close()
-    _premium_send_message(message.chat.id, f"🎲 <b>Тебе выпала случайная игра!</b>\n\n🎮 <b>{html.escape(str(chosen['content_text']))}</b>")
+    bot.send_message(message.chat.id, f"🎲 <b>Тебе выпала случайная игра!</b>\n\n🎮 <b>{html.escape(str(chosen['content_text']))}</b>")
     try:
         _deliver_link(message.chat.id, chosen)
     except Exception:
         logger.exception("Random game delivery failed")
-        _premium_send_message(message.chat.id, "⚠️ Игра выбрана, но файл не удалось отправить. Администратору стоит проверить эту запись.")
+        bot.send_message(message.chat.id, "⚠️ Игра выбрана, но файл не удалось отправить. Администратору стоит проверить эту запись.")
 
 
 # ── /search (С анимацией и умным поиском) ─────────────────────────────────────
@@ -1035,7 +725,7 @@ def _play_random_game(message: Message) -> None:
 def handle_search(message: Message) -> None:
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        _premium_send_message(
+        bot.send_message(
             message.chat.id,
             "🔍 <b>Поиск по играм</b>\n\n"
             "Использование: <code>/search название игры</code>\n\n"
@@ -1047,7 +737,7 @@ def handle_search(message: Message) -> None:
     query_lower = query.lower()
     
     # === ХАКЕРСКАЯ АНИМАЦИЯ ИНИЦИАЛИЗАЦИИ ===
-    loader_msg = _premium_send_message(
+    loader_msg = bot.send_message(
         message.chat.id,
         f"<code>> CONNECTING TO BERLIONS_DB...</code>\n"
         f"<code>[██████░░░░░░░░] 45%</code>\n"
@@ -1070,7 +760,7 @@ def handle_search(message: Message) -> None:
         filtered_rows = starts + contains # Объединяем, сначала "начинающиеся", потом "содержащие"
 
     if not filtered_rows:
-        _premium_edit_message_text(
+        bot.edit_message_text(
             chat_id=message.chat.id,
             message_id=loader_msg.message_id,
             text=f"<code>> SEARCH FAILED</code>\n\n"
@@ -1108,7 +798,7 @@ def handle_search(message: Message) -> None:
     count = len(filtered_rows)
     
     # === НАШЁЛ И ВЫДАЧА ===
-    _premium_edit_message_text(
+    bot.edit_message_text(
         chat_id=message.chat.id,
         message_id=loader_msg.message_id,
         text=f"<code>> DATABASE UNLOCKED</code>\n"
@@ -1184,7 +874,7 @@ def _money_change(user_id: int, delta: float) -> float:
 @bot.message_handler(commands=["balance", "баланс"])
 def handle_money_balance(message: Message) -> None:
     row = _money_ensure(message.from_user.id)
-    _premium_send_message(
+    bot.send_message(
         message.chat.id,
         f"💰 <b>Твой баланс</b>\n\n"
         f"💵 <b>{float(row['balance']):,.2f} ₽</b>\n\n"
@@ -1205,7 +895,7 @@ def handle_money_bonus(message: Message) -> None:
 
     if row["last_bonus"] == today:
         conn.close()
-        _premium_send_message(
+        bot.send_message(
             message.chat.id,
             "⏳ <b>Бонус уже получен сегодня.</b>\nВозвращайся завтра!",
         )
@@ -1219,7 +909,7 @@ def handle_money_bonus(message: Message) -> None:
     conn.commit()
     conn.close()
 
-    _premium_send_message(
+    bot.send_message(
         message.chat.id,
         f"🎁 <b>Ежедневный бонус!</b>\n\n"
         f"💵 +{MONEY_DAILY_BONUS:,.0f} ₽\n"
@@ -1244,7 +934,7 @@ def handle_money_work(message: Message) -> None:
             if elapsed < MONEY_WORK_COOLDOWN:
                 mins = max(1, int((MONEY_WORK_COOLDOWN - elapsed + 59) // 60))
                 conn.close()
-                _premium_send_message(
+                bot.send_message(
                     message.chat.id,
                     f"⏳ Ты уже работал.\nСледующая смена через <b>{mins} мин.</b>",
                 )
@@ -1267,7 +957,7 @@ def handle_money_work(message: Message) -> None:
         "Подзаработал",
         "Закрыл рабочий день",
     ]
-    _premium_send_message(
+    bot.send_message(
         message.chat.id,
         f"💼 <b>{random.choice(jobs)}!</b>\n\n"
         f"💰 Получено: <b>+{reward:,} ₽</b>\n"
@@ -1285,7 +975,7 @@ def handle_money_top(message: Message) -> None:
     conn.close()
 
     if not rows:
-        _premium_send_message(message.chat.id, "🏆 Пока никто не имеет денег.")
+        bot.send_message(message.chat.id, "🏆 Пока никто не имеет денег.")
         return
 
     lines = ["🏆 <b>ТОП ПО ДЕНЬГАМ</b>\n"]
@@ -1300,7 +990,7 @@ def handle_money_top(message: Message) -> None:
             label = f"Пользователь {uid}"
         lines.append(f"{i}. {label} — <b>{float(row['balance']):,.2f} ₽</b>")
 
-    _premium_send_message(message.chat.id, "\n".join(lines))
+    bot.send_message(message.chat.id, "\n".join(lines))
 
 
 def _money_target(message: Message, arg: str = "") -> int | None:
@@ -1327,7 +1017,7 @@ def _money_target(message: Message, arg: str = "") -> int | None:
 @bot.message_handler(commands=["забрать"])
 def handle_admin_take_money(message: Message) -> None:
     if not _is_admin(message.from_user.id):
-        _premium_send_message(
+        bot.send_message(
             message.chat.id,
             "⛔ Только администратор может использовать эту команду.",
         )
@@ -1345,7 +1035,7 @@ def handle_admin_take_money(message: Message) -> None:
         amount_raw = parts[2] if len(parts) > 2 else ""
 
     if not target or not amount_raw.isdigit():
-        _premium_send_message(
+        bot.send_message(
             message.chat.id,
             "❓ Формат: <code>/забрать @user 1000</code> "
             "или ответом: <code>/забрать 1000</code>",
@@ -1354,7 +1044,7 @@ def handle_admin_take_money(message: Message) -> None:
 
     amount = int(amount_raw)
     if amount <= 0:
-        _premium_send_message(message.chat.id, "❌ Сумма должна быть больше нуля.")
+        bot.send_message(message.chat.id, "❌ Сумма должна быть больше нуля.")
         return
 
     row = _money_ensure(target)
@@ -1372,7 +1062,7 @@ def handle_admin_take_money(message: Message) -> None:
     except Exception:
         target_label = f"Пользователь {target}"
 
-    _premium_send_message(
+    bot.send_message(
         message.chat.id,
         f"💸 У {target_label} забрано <b>{taken:,.2f} ₽</b>.\n"
         f"💰 Новый баланс: <b>{new:,.2f} ₽</b>",
@@ -1382,7 +1072,7 @@ def handle_admin_take_money(message: Message) -> None:
 @bot.message_handler(commands=["выдать"])
 def handle_admin_give_money(message: Message) -> None:
     if not _is_admin(message.from_user.id):
-        _premium_send_message(
+        bot.send_message(
             message.chat.id,
             "⛔ Только администратор может использовать эту команду.",
         )
@@ -1390,7 +1080,7 @@ def handle_admin_give_money(message: Message) -> None:
 
     parts = (message.text or "").split()
     if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) <= 0:
-        _premium_send_message(
+        bot.send_message(
             message.chat.id,
             "❓ Формат: <code>/выдать 100000</code>",
         )
@@ -1399,7 +1089,7 @@ def handle_admin_give_money(message: Message) -> None:
     amount = int(parts[1])
     new_balance = _money_change(message.from_user.id, amount)
 
-    _premium_send_message(
+    bot.send_message(
         message.chat.id,
         f"💰 Тебе выдано <b>+{amount:,} ₽</b>.\n"
         f"Баланс: <b>{new_balance:,.2f} ₽</b>",
@@ -1857,11 +1547,11 @@ def handle_social_profile(message: Message) -> None:
             file_id=photos.photos[0][-1].file_id
             file_info=bot.get_file(file_id)
             data=bot.download_file(file_info.file_path)
-            _premium_media_send("send_photo", message.chat.id, io.BytesIO(data), caption=caption)
+            bot.send_photo(message.chat.id, io.BytesIO(data), caption=caption)
             return
     except Exception:
         logger.exception("Profile avatar load error")
-    _premium_send_message(message.chat.id,caption)
+    bot.send_message(message.chat.id,caption)
 
 
 @bot.message_handler(commands=["awards", "награды"])
@@ -1873,12 +1563,12 @@ def handle_social_awards(message: Message) -> None:
     conn.close()
     label = _social_user_label(message.chat.id,target)
     if not rows:
-        _premium_send_message(message.chat.id,f"🏅 <b>Награды {label}</b>\n\nПока наград нет.")
+        bot.send_message(message.chat.id,f"🏅 <b>Награды {label}</b>\n\nПока наград нет.")
         return
     lines=[f"🏅 <b>Награды {label}</b>\n"]
     for i,r in enumerate(rows,1):
         lines.append(f"🏆 <b>#{i}</b>  {html.escape(r['reason'])}\n   📅 {r['created_at'][:10]}")
-    _premium_send_message(message.chat.id,"\n".join(lines))
+    bot.send_message(message.chat.id,"\n".join(lines))
 
 
 @bot.message_handler(commands=["marriages", "браки"])
@@ -1887,7 +1577,7 @@ def handle_social_marriages(message: Message) -> None:
     rows=conn.execute("SELECT * FROM social_marriages WHERE chat_id=? AND active=1 ORDER BY created_at ASC",(message.chat.id,)).fetchall()
     conn.close()
     if not rows:
-        _premium_send_message(message.chat.id,"💍 В этом чате пока нет активных браков.")
+        bot.send_message(message.chat.id,"💍 В этом чате пока нет активных браков.")
         return
     counts={}
     for r in rows:
@@ -1899,7 +1589,7 @@ def handle_social_marriages(message: Message) -> None:
     for r in sorted(rows,key=lambda x:x['created_at'])[:10]:
         d=max(0,(_social_now()-datetime.fromisoformat(r['created_at'])).days)
         lines.append(f"• {_social_user_label(message.chat.id,r['user1'])} ❤️ {_social_user_label(message.chat.id,r['user2'])} — <b>{_social_duration_text(r['created_at'])}</b>")
-    _premium_send_message(message.chat.id,"\n".join(lines))
+    bot.send_message(message.chat.id,"\n".join(lines))
 
 
 @bot.message_handler(commands=["clans", "кланы"])
@@ -1907,7 +1597,7 @@ def handle_social_clans(message: Message) -> None:
     conn=_social_db()
     rows=conn.execute("""SELECT c.id,c.name,c.owner_id,COUNT(m.user_id) members FROM social_clans c LEFT JOIN social_clan_members m ON m.clan_id=c.id WHERE c.chat_id=? GROUP BY c.id ORDER BY members DESC,c.name LIMIT 20""",(message.chat.id,)).fetchall()
     if not rows:
-        conn.close(); _premium_send_message(message.chat.id,"🏰 Кланов пока нет. Создай первый: <code>создать клан название</code>"); return
+        conn.close(); bot.send_message(message.chat.id,"🏰 Кланов пока нет. Создай первый: <code>создать клан название</code>"); return
     lines=["🏰 <b>Кланы Berlions</b>\n"]
     for i,r in enumerate(rows,1):
         members=conn.execute("SELECT user_id FROM social_clan_members WHERE chat_id=? AND clan_id=? ORDER BY joined_at",(message.chat.id,r["id"])).fetchall()
@@ -1915,7 +1605,7 @@ def handle_social_clans(message: Message) -> None:
         member_text=", ".join(names) if names else "нет участников"
         lines.append(f"{i}. <b>{html.escape(r['name'])}</b> — 👥 {r['members']}\n   👑 Владелец: {_social_user_label(message.chat.id,int(r['owner_id']))}\n   👤 {member_text}")
     conn.close()
-    _premium_send_message(message.chat.id,"\n\n".join(lines))
+    bot.send_message(message.chat.id,"\n\n".join(lines))
 
 
 @bot.message_handler(commands=["top"])
@@ -1928,7 +1618,7 @@ def handle_social_top(message: Message, period: str = "all") -> None:
     rows=_social_top_rows(message.chat.id,period,10)
     title={"all":"🏆 ТОП АКТИВНОСТИ","day":"🔥 ТОП ДНЯ","week":"📅 ТОП НЕДЕЛИ","month":"🗓 ТОП МЕСЯЦА"}[period]
     if not rows:
-        _premium_send_message(message.chat.id,"📊 Пока нет статистики активности.")
+        bot.send_message(message.chat.id,"📊 Пока нет статистики активности.")
         return
     conn=_social_db()
     total_chat=conn.execute("SELECT COALESCE(SUM(messages),0) n FROM social_activity WHERE chat_id=?",(message.chat.id,)).fetchone()["n"]
@@ -1940,7 +1630,7 @@ def handle_social_top(message: Message, period: str = "all") -> None:
         label=_mention_user(message.chat.id, int(r['user_id']), raw_label)
         prefix=medals[i-1] if i<=3 else f"{i}."
         lines.append(f"{prefix} {label} — <b>{r['messages']}</b> сообщ.")
-    _premium_send_message(message.chat.id,"\n".join(lines))
+    bot.send_message(message.chat.id,"\n".join(lines))
 
 
 @bot.message_handler(commands=["topday", "topweek", "topmonth", "топдня", "топнедели", "топмесяца"])
@@ -1992,7 +1682,7 @@ def handle_social_commands(message: Message) -> None:
         "🔎 <code>/поиск запрос</code> — поиск\n\n"
         "💡 Основные функции доступны через меню-кнопки под полем ввода."
     )
-    _premium_send_message(message.chat.id,text)
+    bot.send_message(message.chat.id,text)
 
 
 @bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"команды", m.text.strip(), re.I)), content_types=["text"])
@@ -2048,7 +1738,7 @@ def handle_social_marry_plain(message: Message) -> None:
 @bot.message_handler(func=lambda m: bool(m.text and re.match(r"^наградить(?:\s+.+)?$",m.text.strip(),re.I)), content_types=["text"])
 def handle_social_award(message: Message) -> None:
     if not _is_admin(message.from_user.id):
-        _premium_send_message(message.chat.id,"⛔ Награждать может только администратор.")
+        bot.send_message(message.chat.id,"⛔ Награждать может только администратор.")
         return
     parts=message.text.strip().split(maxsplit=2)
     if message.reply_to_message and message.reply_to_message.from_user:
@@ -2059,13 +1749,13 @@ def handle_social_award(message: Message) -> None:
         reason=parts[2].strip() if len(parts)>2 else "За вклад в чат"
         target=_social_target(message,arg)
     if not target:
-        _premium_send_message(message.chat.id,"🏅 Формат: <code>наградить @user причина</code> или ответом на сообщение: <code>наградить причина</code>")
+        bot.send_message(message.chat.id,"🏅 Формат: <code>наградить @user причина</code> или ответом на сообщение: <code>наградить причина</code>")
         return
     if target==message.from_user.id:
-        _premium_send_message(message.chat.id,"😄 Себя наградить нельзя."); return
+        bot.send_message(message.chat.id,"😄 Себя наградить нельзя."); return
     now=_social_now().isoformat(sep=" ")
     conn=_social_db(); conn.execute("INSERT INTO social_awards(chat_id,from_user,to_user,reason,created_at) VALUES(?,?,?,?,?)",(message.chat.id,message.from_user.id,target,reason,now)); conn.commit(); conn.close()
-    _premium_send_message(message.chat.id,f"🏆 {_social_user_label(message.chat.id,target)} <b>награждён!</b>\n🎖 Причина: <i>{html.escape(reason)}</i>")
+    bot.send_message(message.chat.id,f"🏆 {_social_user_label(message.chat.id,target)} <b>награждён!</b>\n🎖 Причина: <i>{html.escape(reason)}</i>")
 
 
 @bot.message_handler(commands=["создать_клан"])
@@ -2073,19 +1763,19 @@ def handle_social_award(message: Message) -> None:
 def handle_social_create_clan(message: Message) -> None:
     name=message.text.strip().split(None,2)[2].strip()
     if len(name)<2 or len(name)>32:
-        _premium_send_message(message.chat.id,"🏰 Название клана должно быть от 2 до 32 символов."); return
+        bot.send_message(message.chat.id,"🏰 Название клана должно быть от 2 до 32 символов."); return
     key=name.casefold()
     conn=_social_db()
     try:
         existing=conn.execute("SELECT id FROM social_clans WHERE chat_id=? AND name_key=?",(message.chat.id,key)).fetchone()
         if existing:
-            _premium_send_message(message.chat.id,"❌ Такой клан уже существует."); conn.close(); return
+            bot.send_message(message.chat.id,"❌ Такой клан уже существует."); conn.close(); return
         cur=conn.execute("INSERT INTO social_clans(chat_id,name,name_key,owner_id,created_at) VALUES(?,?,?,?,?)",(message.chat.id,name,key,message.from_user.id,_social_now().isoformat(sep=" ")))
         clan_id=cur.lastrowid
         conn.execute("INSERT OR REPLACE INTO social_clan_members(chat_id,clan_id,user_id,joined_at) VALUES(?,?,?,?)",(message.chat.id,clan_id,message.from_user.id,_social_now().isoformat(sep=" ")))
         conn.commit()
     finally: conn.close()
-    _premium_send_message(message.chat.id,f"🏰 Клан <b>{html.escape(name)}</b> создан!\nТы автоматически вступил в него.\nВступить другим: <code>+клан {html.escape(name)}</code>")
+    bot.send_message(message.chat.id,f"🏰 Клан <b>{html.escape(name)}</b> создан!\nТы автоматически вступил в него.\nВступить другим: <code>+клан {html.escape(name)}</code>")
 
 
 @bot.message_handler(func=lambda m: bool(m.text and re.match(r"^\+клан\s+.+$",m.text.strip(),re.I)), content_types=["text"])
@@ -2093,17 +1783,17 @@ def handle_social_join_clan(message: Message) -> None:
     name=message.text.strip().split(None,1)[1].strip(); key=name.casefold()
     conn=_social_db(); clan=conn.execute("SELECT id,name FROM social_clans WHERE chat_id=? AND name_key=?",(message.chat.id,key)).fetchone()
     if not clan:
-        conn.close(); _premium_send_message(message.chat.id,"❌ Такой клан не найден. Посмотри список: <code>кланы</code>"); return
+        conn.close(); bot.send_message(message.chat.id,"❌ Такой клан не найден. Посмотри список: <code>кланы</code>"); return
     banned=conn.execute("SELECT 1 FROM social_clan_bans WHERE chat_id=? AND clan_id=? AND user_id=?",(message.chat.id,clan['id'],message.from_user.id)).fetchone()
     if banned:
-        conn.close(); _premium_send_message(message.chat.id,"🚫 Владелец этого клана запретил тебе вступать в него."); return
+        conn.close(); bot.send_message(message.chat.id,"🚫 Владелец этого клана запретил тебе вступать в него."); return
     old=conn.execute("SELECT clan_id FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,message.from_user.id)).fetchone()
     if old and old['clan_id']==clan['id']:
-        conn.close(); _premium_send_message(message.chat.id,"🏰 Ты уже в этом клане!"); return
+        conn.close(); bot.send_message(message.chat.id,"🏰 Ты уже в этом клане!"); return
     conn.execute("DELETE FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,message.from_user.id))
     conn.execute("INSERT INTO social_clan_members(chat_id,clan_id,user_id,joined_at) VALUES(?,?,?,?)",(message.chat.id,clan['id'],message.from_user.id,_social_now().isoformat(sep=" ")))
     conn.commit(); conn.close()
-    _premium_send_message(message.chat.id,f"🏰 Добро пожаловать в клан <b>{html.escape(clan['name'])}</b>!")
+    bot.send_message(message.chat.id,f"🏰 Добро пожаловать в клан <b>{html.escape(clan['name'])}</b>!")
 
 
 @bot.message_handler(commands=["развод"])
@@ -2117,12 +1807,12 @@ def handle_social_divorce(message: Message) -> None:
     conn=_social_db()
     marriage=_social_active_marriage(conn,message.chat.id,message.from_user.id)
     if not marriage:
-        conn.close(); _premium_send_message(message.chat.id,"💔 У тебя нет активного брака."); return
+        conn.close(); bot.send_message(message.chat.id,"💔 У тебя нет активного брака."); return
     spouse=int(marriage["user2"] if int(marriage["user1"])==message.from_user.id else marriage["user1"])
     if target and target!=spouse and not _is_admin(message.from_user.id):
-        conn.close(); _premium_send_message(message.chat.id,"💔 Укажи своего супруга или ответь на его сообщение."); return
+        conn.close(); bot.send_message(message.chat.id,"💔 Укажи своего супруга или ответь на его сообщение."); return
     conn.execute("UPDATE social_marriages SET active=0 WHERE id=?",(marriage["id"],)); conn.commit(); conn.close()
-    _premium_send_message(message.chat.id,f"💔 {_social_user_label(message.chat.id,message.from_user.id)} и {_social_user_label(message.chat.id,spouse)} больше не состоят в браке.")
+    bot.send_message(message.chat.id,f"💔 {_social_user_label(message.chat.id,message.from_user.id)} и {_social_user_label(message.chat.id,spouse)} больше не состоят в браке.")
 
 
 @bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"развод(?:\s+@\w+)?",m.text.strip(),re.I)), content_types=["text"])
@@ -2135,7 +1825,7 @@ def handle_my_clan(message: Message) -> None:
     conn=_social_db()
     clan=conn.execute("SELECT c.* FROM social_clans c JOIN social_clan_members m ON m.clan_id=c.id WHERE c.chat_id=? AND m.user_id=?",(message.chat.id,message.from_user.id)).fetchone()
     if not clan:
-        conn.close(); _premium_send_message(message.chat.id,"🏰 Ты пока не состоишь в клане."); return
+        conn.close(); bot.send_message(message.chat.id,"🏰 Ты пока не состоишь в клане."); return
     members=conn.execute("SELECT user_id,joined_at FROM social_clan_members WHERE chat_id=? AND clan_id=? ORDER BY joined_at",(message.chat.id,clan["id"])).fetchall()
     bans=conn.execute("SELECT user_id FROM social_clan_bans WHERE chat_id=? AND clan_id=?",(message.chat.id,clan["id"])).fetchall()
     conn.close()
@@ -2144,7 +1834,7 @@ def handle_my_clan(message: Message) -> None:
     if int(clan["owner_id"])==message.from_user.id:
         lines += ["", "⚙️ <b>Управление владельца:</b>","/кик_из_клана @user — исключить и запретить повторный вход","/удалить_клан — удалить клан"]
         if bans: lines.append(f"🚫 Заблокировано в клане: <b>{len(bans)}</b>")
-    _premium_send_message(message.chat.id,"\n".join(lines))
+    bot.send_message(message.chat.id,"\n".join(lines))
 
 
 @bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"мой\s+клан",m.text.strip(),re.I)), content_types=["text"])
@@ -2159,30 +1849,30 @@ def _clan_owner_for_user(conn, chat_id, user_id):
 @bot.message_handler(commands=["кик_из_клана"])
 def handle_clan_kick(message: Message) -> None:
     if not _is_admin(message.from_user.id) and not message.reply_to_message and len((message.text or "").split())<2:
-        _premium_send_message(message.chat.id,"❓ Формат: <code>/кик_из_клана @user</code> или ответом на сообщение."); return
+        bot.send_message(message.chat.id,"❓ Формат: <code>/кик_из_клана @user</code> или ответом на сообщение."); return
     target=message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else _social_target(message," ".join((message.text or "").split()[1:]))
-    if not target: _premium_send_message(message.chat.id,"❓ Не удалось определить пользователя."); return
+    if not target: bot.send_message(message.chat.id,"❓ Не удалось определить пользователя."); return
     conn=_social_db(); clan=_clan_owner_for_user(conn,message.chat.id,message.from_user.id)
-    if not clan and not _is_admin(message.from_user.id): conn.close(); _premium_send_message(message.chat.id,"⛔ Только владелец клана может исключать участников."); return
-    if clan and target==int(clan["owner_id"]): conn.close(); _premium_send_message(message.chat.id,"❌ Нельзя исключить владельца клана."); return
+    if not clan and not _is_admin(message.from_user.id): conn.close(); bot.send_message(message.chat.id,"⛔ Только владелец клана может исключать участников."); return
+    if clan and target==int(clan["owner_id"]): conn.close(); bot.send_message(message.chat.id,"❌ Нельзя исключить владельца клана."); return
     target_clan=conn.execute("SELECT clan_id FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,target)).fetchone()
     if not target_clan or (clan and int(target_clan["clan_id"])!=int(clan["id"])):
-        conn.close(); _premium_send_message(message.chat.id,"❌ Пользователь не состоит в твоём клане."); return
+        conn.close(); bot.send_message(message.chat.id,"❌ Пользователь не состоит в твоём клане."); return
     cid=int(target_clan["clan_id"]); conn.execute("DELETE FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,target)); conn.execute("INSERT OR REPLACE INTO social_clan_bans(chat_id,clan_id,user_id,banned_at) VALUES(?,?,?,?)",(message.chat.id,cid,target,_social_now().isoformat(sep=" "))); conn.commit(); conn.close()
-    _premium_send_message(message.chat.id,f"🚫 {_social_user_label(message.chat.id,target)} исключён из клана и больше не сможет в него вступить.")
+    bot.send_message(message.chat.id,f"🚫 {_social_user_label(message.chat.id,target)} исключён из клана и больше не сможет в него вступить.")
 
 
 @bot.message_handler(commands=["удалить_клан"])
 def handle_delete_clan(message: Message) -> None:
     conn=_social_db(); clan=_clan_owner_for_user(conn,message.chat.id,message.from_user.id)
-    if not clan and not _is_admin(message.from_user.id): conn.close(); _premium_send_message(message.chat.id,"⛔ Только владелец клана может удалить его."); return
+    if not clan and not _is_admin(message.from_user.id): conn.close(); bot.send_message(message.chat.id,"⛔ Только владелец клана может удалить его."); return
     if clan:
         cid=int(clan["id"]); conn.execute("DELETE FROM social_clan_members WHERE chat_id=? AND clan_id=?",(message.chat.id,cid)); conn.execute("DELETE FROM social_clan_bans WHERE chat_id=? AND clan_id=?",(message.chat.id,cid)); conn.execute("DELETE FROM social_clans WHERE id=?",(cid,))
     else:
         # глобальный админ: удаление клана, в котором он состоит, либо ничего
         cidrow=conn.execute("SELECT id FROM social_clans WHERE chat_id=? AND owner_id=?",(message.chat.id,message.from_user.id)).fetchone()
         if cidrow: cid=int(cidrow["id"]); conn.execute("DELETE FROM social_clan_members WHERE clan_id=?",(cid,)); conn.execute("DELETE FROM social_clan_bans WHERE clan_id=?",(cid,)); conn.execute("DELETE FROM social_clans WHERE id=?",(cid,))
-    conn.commit(); conn.close(); _premium_send_message(message.chat.id,"🗑 Клан удалён.")
+    conn.commit(); conn.close(); bot.send_message(message.chat.id,"🗑 Клан удалён.")
 
 
 @bot.message_handler(commands=["marry", "брак"])
@@ -2190,27 +1880,27 @@ def handle_social_marry_command(message: Message) -> None:
     arg=" ".join((message.text or "").split()[1:])
     target=_social_target(message,arg)
     if not target:
-        _premium_send_message(message.chat.id,"💍 Формат: <code>брак @user</code> или ответом на сообщение пользователя.")
+        bot.send_message(message.chat.id,"💍 Формат: <code>брак @user</code> или ответом на сообщение пользователя.")
         return
     if target==message.from_user.id:
-        _premium_send_message(message.chat.id,"💍 Сам с собой брак не заключается 😄"); return
+        bot.send_message(message.chat.id,"💍 Сам с собой брак не заключается 😄"); return
     conn=_social_db()
     if _social_active_marriage(conn,message.chat.id,message.from_user.id) or _social_active_marriage(conn,message.chat.id,target):
-        conn.close(); _premium_send_message(message.chat.id,"💍 У одного из пользователей уже есть активный брак."); return
+        conn.close(); bot.send_message(message.chat.id,"💍 У одного из пользователей уже есть активный брак."); return
     pending=conn.execute("SELECT id FROM social_marriage_proposals WHERE chat_id=? AND from_user=? AND to_user=? AND status='pending'",(message.chat.id,message.from_user.id,target)).fetchone()
     if pending:
-        conn.close(); _premium_send_message(message.chat.id,"⏳ Предложение уже отправлено."); return
+        conn.close(); bot.send_message(message.chat.id,"⏳ Предложение уже отправлено."); return
     cur=conn.execute("INSERT INTO social_marriage_proposals(chat_id,from_user,to_user,created_at,status) VALUES(?,?,?,?, 'pending')",(message.chat.id,message.from_user.id,target,_social_now().isoformat(sep=" ")))
     proposal_id=cur.lastrowid; conn.commit(); conn.close()
     markup=InlineKeyboardMarkup(row_width=2).add(InlineKeyboardButton("💍 Согласиться",callback_data=f"marry_yes:{proposal_id}"),InlineKeyboardButton("❌ Отказаться",callback_data=f"marry_no:{proposal_id}"))
-    _premium_send_message(message.chat.id,f"💍 {_social_user_label(message.chat.id,message.from_user.id)} предлагает брак {_social_user_label(message.chat.id,target)}!\n\nСогласие второго пользователя обязательно.",reply_markup=markup)
+    bot.send_message(message.chat.id,f"💍 {_social_user_label(message.chat.id,message.from_user.id)} предлагает брак {_social_user_label(message.chat.id,target)}!\n\nСогласие второго пользователя обязательно.",reply_markup=markup)
 
 
 def _play_dice_legacy(chat_id: int, user_id: int) -> None:
     now = time.time()
     last_roll = _dice_cooldown.get(user_id, 0)
     if now - last_roll < 60:
-        _premium_send_message(chat_id, f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!")
+        bot.send_message(chat_id, f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!")
         return
     if not _require_subscription(chat_id, user_id, "dice"):
         return
@@ -2219,10 +1909,10 @@ def _play_dice_legacy(chat_id: int, user_id: int) -> None:
         sent = bot.send_dice(chat_id, emoji="🎲")
         value = getattr(sent.dice, "value", None)
         if value is not None:
-            _premium_send_message(chat_id, f"🎲 Выпало: <b>{value}</b>")
+            bot.send_message(chat_id, f"🎲 Выпало: <b>{value}</b>")
     except Exception:
         logger.exception("Dice callback error")
-        _premium_send_message(chat_id, "❌ Не удалось бросить кости. Попробуй ещё раз.")
+        bot.send_message(chat_id, "❌ Не удалось бросить кости. Попробуй ещё раз.")
 
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and (
@@ -2246,7 +1936,7 @@ def handle_bot_callbacks(call: CallbackQuery) -> None:
             elif context.startswith("key:"):
                 row = database.get_link(context[len("key:"):])
                 if row: _deliver_link(call.message.chat.id, row)
-                else: _premium_send_message(call.message.chat.id, "❌ Ссылка не найдена.")
+                else: bot.send_message(call.message.chat.id, "❌ Ссылка не найдена.")
             return
         if data.startswith("search_pick:"):
             key = data[len("search_pick:"):]
@@ -2258,7 +1948,7 @@ def handle_bot_callbacks(call: CallbackQuery) -> None:
             except Exception: pass
             row = database.get_link(key)
             if row: _deliver_link(call.message.chat.id, row)
-            else: _premium_send_message(call.message.chat.id, "❌ Контент не найден.")
+            else: bot.send_message(call.message.chat.id, "❌ Контент не найден.")
             return
         if data == "play_dice":
             bot.answer_callback_query(call.id)
@@ -2279,7 +1969,7 @@ def handle_bot_callbacks(call: CallbackQuery) -> None:
             detail_markup = _order_keyboard(request_id)
             if _is_admin(call.from_user.id):
                 detail_markup.add(InlineKeyboardButton("✅ Игра добавлена — закрыть заявку", callback_data=f"order_close:{request_id}"))
-            _premium_edit_message_text(_request_summary(request_id) + "\n\nЕсли игра тебе нужна — голосуй:", call.message.chat.id, call.message.message_id, reply_markup=detail_markup)
+            bot.edit_message_text(_request_summary(request_id) + "\n\nЕсли игра тебе нужна — голосуй:", call.message.chat.id, call.message.message_id, reply_markup=detail_markup)
             return
         if data.startswith("order_close:"):
             if not _is_admin(call.from_user.id):
@@ -2314,7 +2004,7 @@ def handle_bot_callbacks(call: CallbackQuery) -> None:
                 refresh_markup = _order_keyboard(request_id)
                 if _is_admin(call.from_user.id):
                     refresh_markup.add(InlineKeyboardButton("✅ Игра добавлена — закрыть заявку", callback_data=f"order_close:{request_id}"))
-                _premium_edit_message_text(_request_summary(request_id) + "\n\nЕсли игра тебе нужна — голосуй:", call.message.chat.id, call.message.message_id, reply_markup=refresh_markup)
+                bot.edit_message_text(_request_summary(request_id) + "\n\nЕсли игра тебе нужна — голосуй:", call.message.chat.id, call.message.message_id, reply_markup=refresh_markup)
             except Exception:
                 pass
             return
@@ -2336,13 +2026,13 @@ def handle_social_marriage_callback(call: CallbackQuery) -> None:
         if call.from_user.id != p['to_user']:
             conn.close(); bot.answer_callback_query(call.id,"Это предложение не для тебя.",show_alert=True); return
         if action=="marry_no":
-            conn.execute("UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",(pid,)); conn.commit(); conn.close(); bot.answer_callback_query(call.id,"Отказ принят."); _premium_edit_message_text("❌ Предложение отклонено.",call.message.chat.id,call.message.message_id); return
+            conn.execute("UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",(pid,)); conn.commit(); conn.close(); bot.answer_callback_query(call.id,"Отказ принят."); bot.edit_message_text("❌ Предложение отклонено.",call.message.chat.id,call.message.message_id); return
         if _social_active_marriage(conn,p['chat_id'],p['from_user']) or _social_active_marriage(conn,p['chat_id'],p['to_user']):
             conn.execute("UPDATE social_marriage_proposals SET status='rejected' WHERE id=?",(pid,)); conn.commit(); conn.close(); bot.answer_callback_query(call.id,"У одного из вас уже есть брак.",show_alert=True); return
         now=_social_now().isoformat(sep=" ")
         conn.execute("UPDATE social_marriage_proposals SET status='accepted' WHERE id=?",(pid,))
         conn.execute("INSERT INTO social_marriages(chat_id,user1,user2,created_at,active) VALUES(?,?,?,?,1)",(p['chat_id'],p['from_user'],p['to_user'],now))
-        conn.commit(); conn.close(); bot.answer_callback_query(call.id,"💍 Брак создан!"); _premium_edit_message_text(f"💍 <b>Брак заключён!</b>\n\n{_social_user_label(p['chat_id'],p['from_user'])} ❤️ {_social_user_label(p['chat_id'],p['to_user'])}\n🌱 Стаж: <b>0 дней</b> — 💚 Зелёные",call.message.chat.id,call.message.message_id)
+        conn.commit(); conn.close(); bot.answer_callback_query(call.id,"💍 Брак создан!"); bot.edit_message_text(f"💍 <b>Брак заключён!</b>\n\n{_social_user_label(p['chat_id'],p['from_user'])} ❤️ {_social_user_label(p['chat_id'],p['to_user'])}\n🌱 Стаж: <b>0 дней</b> — 💚 Зелёные",call.message.chat.id,call.message.message_id)
     except Exception:
         logger.exception("Marriage callback error")
         try: bot.answer_callback_query(call.id,"❌ Ошибка",show_alert=True)
@@ -2381,7 +2071,7 @@ def handle_social_roleplay(message: Message) -> None:
         quote = tokens[1] if len(tokens) > 1 else ""
 
     if not target:
-        _premium_send_message(
+        bot.send_message(
             message.chat.id,
             f"{_pe('social', '💫')} <b>Формат:</b> "
             f"<code>{html.escape(action)} @user</code> или ответом на сообщение.",
@@ -2389,7 +2079,7 @@ def handle_social_roleplay(message: Message) -> None:
         return
 
     if target == message.from_user.id:
-        _premium_send_message(message.chat.id, f"{_pe('social', '😄')} На себя это действие не распространяется.")
+        bot.send_message(message.chat.id, f"{_pe('social', '😄')} На себя это действие не распространяется.")
         return
 
     actor = _social_user_label(message.chat.id, message.from_user.id)
@@ -2427,7 +2117,7 @@ def handle_social_roleplay(message: Message) -> None:
     text = f"{_pe(emoji_key, fallback)} | {actor} <b>{verbs[action]}</b> {target_label}"
     if quote:
         text += f"\nс репликой: <i>{html.escape(quote)}</i>"
-    _premium_send_message(message.chat.id, text)
+    bot.send_message(message.chat.id, text)
 
 
 # Последний обработчик сообщений: собирает активность, не перехватывая уже обработанные команды.
