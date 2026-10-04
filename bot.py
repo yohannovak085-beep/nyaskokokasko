@@ -115,6 +115,14 @@ def _orders_init_db() -> None:
         user_id INTEGER PRIMARY KEY,
         last_used REAL NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS game_search_users (
+        game_key TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        game_name TEXT NOT NULL,
+        found_at TEXT NOT NULL,
+        PRIMARY KEY(game_key, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_game_search_users_game ON game_search_users(game_key);
     """)
     conn.commit()
     conn.close()
@@ -132,8 +140,61 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
         KeyboardButton("📋 Стол заказов"),
         KeyboardButton("🎲 Рандомная игра"),
         KeyboardButton("👤 Профиль"),
+        KeyboardButton("🔥 Самая разыскиваемая"),
     )
     return markup
+
+
+def _record_game_searches(user_id: int, rows) -> None:
+    """Записывает уникальных пользователей, которые нашли игру через /поиск или /search."""
+    if not rows:
+        return
+    now = datetime.now().isoformat(timespec="seconds") if 'datetime' in globals() else time.strftime("%Y-%m-%d %H:%M:%S")
+    conn = _orders_db()
+    try:
+        conn.executemany(
+            "INSERT OR IGNORE INTO game_search_users(game_key,user_id,game_name,found_at) VALUES(?,?,?,?)",
+            [(str(row["key"]), int(user_id), str(row["content_text"]), now) for row in rows[:15]],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _send_most_wanted(chat_id: int) -> None:
+    """Показывает топ игр по числу уникальных пользователей, нашедших их через поиск."""
+    conn = _orders_db()
+    rows = conn.execute("""
+        SELECT game_key, MAX(game_name) AS game_name, COUNT(*) AS users, MAX(found_at) AS last_found
+        FROM game_search_users
+        GROUP BY game_key
+        ORDER BY users DESC, last_found DESC, game_name COLLATE NOCASE ASC
+        LIMIT 10
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        bot.send_message(
+            chat_id,
+            "🔥 <b>Самая разыскиваемая игра</b>\n\n"
+            "Пока статистики нет. Найди игру через <code>/поиск название</code> — и она появится здесь!",
+        )
+        return
+
+    lines = [
+        "🔥 <b>САМЫЕ РАЗЫСКИВАЕМЫЕ ИГРЫ</b>",
+        "",
+        "Рейтинг по количеству <b>уникальных пользователей</b>, которые нашли игру через поиск:",
+        "",
+    ]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, row in enumerate(rows, 1):
+        prefix = medals[i - 1] if i <= 3 else f"<b>{i}.</b>"
+        n = int(row["users"])
+        word = "человек" if n == 1 else ("человека" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "человек")
+        lines.append(f"{prefix} 🎮 <b>{html.escape(str(row['game_name']))}</b> — 👥 <b>{n}</b> {word}")
+
+    bot.send_message(chat_id, "\n".join(lines))
 
 def _send_main_menu(chat_id: int, text: str | None = None) -> None:
     bot.send_message(chat_id, text or "🎮 <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇", reply_markup=_menu_keyboard())
@@ -403,6 +464,20 @@ def handle_menu_profile(message: Message) -> None:
     handle_social_profile(message)
 
 
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "🔥 Самая разыскиваемая"), content_types=["text"])
+def handle_menu_most_wanted(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "most_wanted"):
+        return
+    _send_most_wanted(message.chat.id)
+
+
+@bot.message_handler(commands=["топигр", "mostwanted", "разыскиваемые"])
+def handle_most_wanted_command(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "most_wanted_cmd"):
+        return
+    _send_most_wanted(message.chat.id)
+
+
 @bot.message_handler(func=lambda m: bool(
     m.chat.type == "private" and m.text and m.from_user and
     _order_pending.get(m.from_user.id) == m.chat.id and
@@ -648,6 +723,10 @@ def handle_search(message: Message) -> None:
                     url=_deep_link(row["key"]),
                 )
             )
+
+    # Засчитываем только те игры, которые реально показали пользователю.
+    # Повторные поиски одним и тем же пользователем рейтинг не накручивают.
+    _record_game_searches(message.from_user.id, filtered_rows[:15])
 
     count = len(filtered_rows)
     
