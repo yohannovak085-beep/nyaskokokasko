@@ -438,6 +438,197 @@ def _bot_username() -> str:
 def _deep_link(key: str) -> str:
     return f"https://t.me/{_bot_username()}?start={key}"
 
+# ── /stop — завершение сбора файлов для админов ───────────────────────────────
+
+@bot.message_handler(commands=["stop"])
+def handle_stop(message: Message) -> None:
+    if not _is_admin(message.from_user.id): return
+    state = _pending.get(message.from_user.id)
+    if state is None or state["step"] not in ("collecting_files", "edit_collecting_files"):
+        bot.send_message(message.chat.id, "ℹ️ /stop используется только во время добавления файлов.")
+        return
+
+    files: list[tuple[str, str]] = state.get("files", [])
+    step = state["step"]
+
+    if step == "collecting_files":
+        if not files:
+            bot.send_message(message.chat.id, "⚠️ Ты не добавил ни одного файла. Отправь хотя бы один файл или URL.")
+            return
+        content_text = state["content_text"]
+        del _pending[message.from_user.id]
+        try:
+            key = database.create_link(content_text=content_text, files=files)
+            bot.send_message(message.chat.id, f"✅ <b>Ссылка создана!</b> ({len(files)} файл(ов))\n\n🔑 Ключ: <code>{key}</code>\n\n📎 Вставь эту ссылку в канал:\n<code>{_deep_link(key)}</code>", disable_web_page_preview=True)
+            logger.info("Admin created key %r with %d file(s)", key, len(files))
+        except Exception as exc:
+            logger.exception("create_link failed: %s", exc)
+            bot.send_message(message.chat.id, f"❌ Ошибка при сохранении: {exc}")
+
+    elif step == "edit_collecting_files":
+        key = state["key"]
+        new_text = state.get("new_text")
+        if not files and new_text is None:
+            del _pending[message.from_user.id]
+            bot.send_message(message.chat.id, f"ℹ️ Редактирование <code>{key}</code> отменено.")
+            return
+        del _pending[message.from_user.id]
+        try:
+            database.update_link(key, content_text=new_text, files=files if files else None, clear_url=bool(files))
+            bot.send_message(message.chat.id, f"✅ Ключ <code>{key}</code> обновлён" + (f" — {len(files)} файл(ов) сохранено." if files else " (текст обновлён)."))
+            logger.info("Admin edited key %r → %d file(s)", key, len(files))
+        except Exception as exc:
+            bot.send_message(message.chat.id, f"❌ Ошибка: {exc}")
+
+# ── Admin: /add ───────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["add"])
+def handle_add(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ У тебя нет доступа к этой команде.")
+        return
+    _pending[message.from_user.id] = {"step": "awaiting_text"}
+    bot.send_message(message.chat.id, "📝 <b>Шаг 1/2</b> — Отправь описание / текст, который увидит пользователь:")
+
+# ── Admin: /list ──────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["list"])
+def handle_list(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ У тебя нет доступа к этой команде.")
+        return
+    rows = database.list_links()
+    if not rows:
+        bot.send_message(message.chat.id, "📭 Пока не создано ни одной ссылки.")
+        return
+    lines = ["<b>📋 Все созданные ссылки:</b>\n"]
+    for row in rows:
+        created = str(row["created_at"])[:16]
+        files = database.get_link_files(row["key"])
+        content_type = f"📎 {len(files)} файл(ов)" if files else ("🔗 " + row["target_url"] if row["target_url"] else "📄 текст")
+        lines.append(f"🔑 <code>{row['key']}</code>  ({created})  [{content_type}]\n   📄 {row['content_text'][:60]}{'…' if len(row['content_text']) > 60 else ''}\n   👉 <a href='{_deep_link(row['key'])}'>Ссылка для канала</a>\n")
+    bot.send_message(message.chat.id, "\n".join(lines), disable_web_page_preview=True)
+
+# ── Admin: /delete ────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["delete"])
+def handle_delete(message: Message) -> None:
+    if not _is_admin(message.from_user.id): return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "❓ Укажи ключ: <code>/delete ключ</code>\nКлючи можно посмотреть командой /list")
+        return
+    key = parts[1].strip()
+    row = database.get_link(key)
+    if row is None:
+        bot.send_message(message.chat.id, f"❌ Ключ <code>{key}</code> не найден.")
+        return
+    database.delete_link(key)
+    bot.send_message(message.chat.id, f"🗑 Ссылка <code>{key}</code> удалена.\n📄 Текст был: {row['content_text'][:80]}")
+    logger.info("Admin deleted key %r", key)
+
+# ── Admin: /edit ──────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["edit"])
+def handle_edit(message: Message) -> None:
+    if not _is_admin(message.from_user.id): return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "❓ Укажи ключ: <code>/edit ключ</code>\nКлючи можно посмотреть командой /list")
+        return
+    key = parts[1].strip()
+    row = database.get_link(key)
+    if row is None:
+        bot.send_message(message.chat.id, f"❌ Ключ <code>{key}</code> не найден.")
+        return
+    files = database.get_link_files(key)
+    content_type = f"📎 {len(files)} файл(ов)" if files else ("🔗 " + row["target_url"] if row["target_url"] else "📄 только текст")
+    bot.send_message(
+        message.chat.id,
+        f"✏️ <b>Редактируем</b> <code>{key}</code>\n\n📄 Текст: {row['content_text']}\nКонтент: {content_type}\n\n<b>Шаг 1/2</b> — Отправь новый текст описания.\nЧтобы оставить текущий — отправь <code>-</code>",
+    )
+    _pending[message.from_user.id] = {"step": "edit_text", "key": key}
+
+# ── Admin conversation (логика диалога для /add и /edit) ───────────────────────
+
+@bot.message_handler(
+    func=lambda m: (m.from_user.id in _pending and not (m.text and m.text.startswith("/"))),
+    content_types=[ "text", "document", "photo", "video", "audio", "voice", "animation", ],
+)
+def handle_conversation(message: Message) -> None:
+    state = _pending.get(message.from_user.id)
+    if state is None: return
+    step = state["step"]
+
+    if step == "awaiting_text":
+        if message.content_type != "text":
+            bot.send_message(message.chat.id, "⚠️ На этом шаге нужен текст:")
+            return
+        state["content_text"] = message.text.strip()
+        state["step"] = "collecting_files"
+        state["files"] = []
+        bot.send_message(message.chat.id, "📎 <b>Шаг 2/2</b> — Отправь файл(ы) (фото, video, документ…).\n\n• Добавляй по одному — бот подтвердит каждый.\n• Когда всё загружено — напиши /stop для сохранения.\n• Или отправь текстом <b>ссылку</b> (http://…) вместо файла.")
+
+    elif step == "collecting_files":
+        file_id, file_type = _extract_file(message)
+        if file_id:
+            state["files"].append((file_id, file_type))
+            _files_added_reply(message.chat.id, len(state["files"]))
+        elif message.content_type == "text":
+            url = message.text.strip()
+            if not (url.startswith("http://") or url.startswith("https://")):
+                bot.send_message(message.chat.id, "⚠️ Ссылка должна начинаться с <code>http://</code> или <code>https://</code>. Попробуй ещё раз или отправь файл.")
+                return
+            content_text = state["content_text"]
+            del _pending[message.from_user.id]
+            try:
+                key = database.create_link(content_text=content_text, target_url=url)
+                bot.send_message(message.chat.id, f"✅ <b>Ссылка создана!</b>\n\n🔑 Ключ: <code>{key}</code>\n\n📎 Вставь эту ссылку в канал:\n<code>{_deep_link(key)}</code>", disable_web_page_preview=True)
+                logger.info("Admin created url-link key %r", key)
+            except Exception as exc:
+                logger.exception("create_link failed: %s", exc)
+                bot.send_message(message.chat.id, f"❌ Ошибка при сохранении: {exc}")
+        else: bot.send_message(message.chat.id, "⚠️ Отправь файл, ссылку, или /stop чтобы сохранить добавленное.")
+
+    elif step == "edit_text":
+        if message.content_type != "text":
+            bot.send_message(message.chat.id, "⚠️ На этом шаге нужен текст. Отправь новый текст или <code>-</code>:")
+            return
+        text = message.text.strip()
+        state["new_text"] = None if text == "-" else text
+        state["step"] = "edit_collecting_files"
+        state["files"] = []
+        bot.send_message(message.chat.id, "📎 <b>Шаг 2/2</b> — Отправь новые файлы (старые заменятся).\n\n• Отправляй по одному — бот подтвердит каждый.\n• Когда всё готово — напиши /stop для сохранения.\n• Или отправь текстом <b>ссылку</b> (http://…) вместо файлов.\n• Чтобы оставить текущий контент — напиши /stop сразу.")
+
+    elif step == "edit_collecting_files":
+        file_id, file_type = _extract_file(message)
+        if file_id:
+            state["files"].append((file_id, file_type))
+            _files_added_reply(message.chat.id, len(state["files"]))
+        elif message.content_type == "text":
+            url = message.text.strip()
+            if url == "-":
+                key = state["key"]
+                new_text = state.get("new_text")
+                del _pending[message.from_user.id]
+                if new_text is not None: database.update_link(key, content_text=new_text)
+                bot.send_message(message.chat.id, f"✅ Ключ <code>{key}</code> обновлён (контент не изменён).")
+                logger.info("Admin edited key %r (text only)", key)
+                return
+            if not (url.startswith("http://") or url.startswith("https://")):
+                bot.send_message(message.chat.id, "⚠️ Ссылка должна начинаться с <code>http://</code> или <code>https://</code>. Попробуй ещё раз, или отправь файл, или <code>-</code> чтобы оставить текущее.")
+                return
+            key = state["key"]
+            new_text = state.get("new_text")
+            del _pending[message.from_user.id]
+            try:
+                database.update_link(key, content_text=new_text, target_url=url, clear_files=True)
+                bot.send_message(message.chat.id, f"✅ Ключ <code>{key}</code> обновлён — новая ссылка сохранена.")
+                logger.info("Admin edited key %r → new url", key)
+            except Exception as exc: bot.send_message(message.chat.id, f"❌ Ошибка: {exc}")
+        else: bot.send_message(message.chat.id, "⚠️ Отправь файл, ссылку, <code>-</code> чтобы оставить текущее, или /stop чтобы сохранить уже добавленные файлы.")
+
+
 # ── Инструмент для получения Custom Emoji ID ──────────────────────────────────
 @bot.message_handler(commands=["emojiid", "эмодзиid"])
 def handle_emoji_id(message: Message) -> None:
