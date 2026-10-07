@@ -1024,296 +1024,11 @@ def handle_search(message: Message) -> None:
     )
 
 
-# ── BERLIONS MONEY SYSTEM ─────────────────────────────────────────────────────
-# Отдельная система игровой валюты.
-
-from datetime import datetime
-
-MONEY_DB = "money.db"
-MONEY_START_BALANCE = 10_000.0
-MONEY_DAILY_BONUS = 1_000.0
-MONEY_WORK_COOLDOWN = 30 * 60
-_money_work_cooldown: dict[int, float] = {}
-
-
-def _money_db():
-    conn = sqlite3.connect(MONEY_DB, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
-
-
-def _money_init_db() -> None:
-    conn = _money_db()
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS wallets ("
-        "user_id INTEGER PRIMARY KEY,"
-        "balance REAL NOT NULL DEFAULT 10000,"
-        "last_bonus TEXT,"
-        "last_work TEXT"
-        ")"
-    )
-    conn.commit()
-    conn.close()
-
-
-_money_init_db()
-
-
-def _money_ensure(user_id: int):
-    conn = _money_db()
-    conn.execute(
-        "INSERT OR IGNORE INTO wallets(user_id,balance) VALUES(?,?)",
-        (user_id, MONEY_START_BALANCE),
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM wallets WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def _money_change(user_id: int, delta: float) -> float:
-    conn = _money_db()
-    conn.execute(
-        "INSERT OR IGNORE INTO wallets(user_id,balance) VALUES(?,?)",
-        (user_id, MONEY_START_BALANCE),
-    )
-    conn.execute("UPDATE wallets SET balance=balance+? WHERE user_id=?", (delta, user_id))
-    row = conn.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)).fetchone()
-    conn.commit()
-    conn.close()
-    return float(row["balance"])
-
-
-@bot.message_handler(commands=["balance", "баланс"])
-def handle_money_balance(message: Message) -> None:
-    row = _money_ensure(message.from_user.id)
-    bot.send_message(
-        message.chat.id,
-        f"💰 <b>Твой баланс</b>\n\n"
-        f"💵 <b>{float(row['balance']):,.2f} ₽</b>\n\n"
-        f"🎁 Ежедневный бонус: /бонус\n"
-        f"💼 Работа: /работа",
-    )
-
-
-@bot.message_handler(commands=["bonus", "бонус"])
-def handle_money_bonus(message: Message) -> None:
-    user_id = message.from_user.id
-    _money_ensure(user_id)
-    today = datetime.now().date().isoformat()
-    conn = _money_db()
-    row = conn.execute(
-        "SELECT balance,last_bonus FROM wallets WHERE user_id=?", (user_id,)
-    ).fetchone()
-
-    if row["last_bonus"] == today:
-        conn.close()
-        bot.send_message(
-            message.chat.id,
-            "⏳ <b>Бонус уже получен сегодня.</b>\nВозвращайся завтра!",
-        )
-        return
-
-    new_balance = float(row["balance"]) + MONEY_DAILY_BONUS
-    conn.execute(
-        "UPDATE wallets SET balance=?,last_bonus=? WHERE user_id=?",
-        (new_balance, today, user_id),
-    )
-    conn.commit()
-    conn.close()
-
-    bot.send_message(
-        message.chat.id,
-        f"🎁 <b>Ежедневный бонус!</b>\n\n"
-        f"💵 +{MONEY_DAILY_BONUS:,.0f} ₽\n"
-        f"💰 Баланс: <b>{new_balance:,.2f} ₽</b>",
-    )
-
-
-@bot.message_handler(commands=["работа", "work"])
-def handle_money_work(message: Message) -> None:
-    user_id = message.from_user.id
-    _money_ensure(user_id)
-
-    conn = _money_db()
-    row = conn.execute(
-        "SELECT balance,last_work FROM wallets WHERE user_id=?", (user_id,)
-    ).fetchone()
-    now = datetime.now()
-
-    if row["last_work"]:
-        try:
-            elapsed = (now - datetime.fromisoformat(row["last_work"])).total_seconds()
-            if elapsed < MONEY_WORK_COOLDOWN:
-                mins = max(1, int((MONEY_WORK_COOLDOWN - elapsed + 59) // 60))
-                conn.close()
-                bot.send_message(
-                    message.chat.id,
-                    f"⏳ Ты уже работал.\nСледующая смена через <b>{mins} мин.</b>",
-                )
-                return
-        except Exception:
-            pass
-
-    reward = random.randint(500, 3000)
-    new_balance = float(row["balance"]) + reward
-    conn.execute(
-        "UPDATE wallets SET balance=?,last_work=? WHERE user_id=?",
-        (new_balance, now.isoformat(timespec="seconds"), user_id),
-    )
-    conn.commit()
-    conn.close()
-
-    jobs = [
-        "Отработал смену",
-        "Выполнил заказ",
-        "Подзаработал",
-        "Закрыл рабочий день",
-    ]
-    bot.send_message(
-        message.chat.id,
-        f"💼 <b>{random.choice(jobs)}!</b>\n\n"
-        f"💰 Получено: <b>+{reward:,} ₽</b>\n"
-        f"💳 Баланс: <b>{new_balance:,.2f} ₽</b>\n\n"
-        f"⏱ Следующая работа — через 30 минут.",
-    )
-
-
-@bot.message_handler(commands=["топденьги", "topmoney", "toptraders"])
-def handle_money_top(message: Message) -> None:
-    conn = _money_db()
-    rows = conn.execute(
-        "SELECT user_id,balance FROM wallets ORDER BY balance DESC LIMIT 20"
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        bot.send_message(message.chat.id, "🏆 Пока никто не имеет денег.")
-        return
-
-    lines = ["🏆 <b>ТОП ПО ДЕНЬГАМ</b>\n"]
-    for i, row in enumerate(rows, 1):
-        uid = int(row["user_id"])
-        try:
-            label = _social_user_label(
-                message.chat.id,
-                uid,
-            )
-        except Exception:
-            label = f"Пользователь {uid}"
-        lines.append(f"{i}. {label} — <b>{float(row['balance']):,.2f} ₽</b>")
-
-    bot.send_message(message.chat.id, "\n".join(lines))
-
-
-def _money_target(message: Message, arg: str = "") -> int | None:
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user.id
-
-    try:
-        target = _social_target(message, arg)
-        if target:
-            return target
-    except Exception:
-        pass
-
-    token = (arg or "").split()[0] if (arg or "").split() else ""
-    if token.startswith("@"):
-        try:
-            member = bot.get_chat_member(message.chat.id, token)
-            return member.user.id
-        except Exception:
-            return None
-    return None
-
-
-@bot.message_handler(commands=["забрать"])
-def handle_admin_take_money(message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        bot.send_message(
-            message.chat.id,
-            "⛔ Только администратор может использовать эту команду.",
-        )
-        return
-
-    parts = (message.text or "").split(maxsplit=2)
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user.id
-        amount_raw = parts[1] if len(parts) > 1 else ""
-    else:
-        target = _money_target(
-            message,
-            parts[1] if len(parts) > 1 else "",
-        )
-        amount_raw = parts[2] if len(parts) > 2 else ""
-
-    if not target or not amount_raw.isdigit():
-        bot.send_message(
-            message.chat.id,
-            "❓ Формат: <code>/забрать @user 1000</code> "
-            "или ответом: <code>/забрать 1000</code>",
-        )
-        return
-
-    amount = int(amount_raw)
-    if amount <= 0:
-        bot.send_message(message.chat.id, "❌ Сумма должна быть больше нуля.")
-        return
-
-    row = _money_ensure(target)
-    old = float(row["balance"])
-    taken = min(old, float(amount))
-    new = old - taken
-
-    conn = _money_db()
-    conn.execute("UPDATE wallets SET balance=? WHERE user_id=?", (new, target))
-    conn.commit()
-    conn.close()
-
-    try:
-        target_label = _social_user_label(message.chat.id, target)
-    except Exception:
-        target_label = f"Пользователь {target}"
-
-    bot.send_message(
-        message.chat.id,
-        f"💸 У {target_label} забрано <b>{taken:,.2f} ₽</b>.\n"
-        f"💰 Новый баланс: <b>{new:,.2f} ₽</b>",
-    )
-
-
-@bot.message_handler(commands=["выдать"])
-def handle_admin_give_money(message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        bot.send_message(
-            message.chat.id,
-            "⛔ Только администратор может использовать эту команду.",
-        )
-        return
-
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) <= 0:
-        bot.send_message(
-            message.chat.id,
-            "❓ Формат: <code>/выдать 100000</code>",
-        )
-        return
-
-    amount = int(parts[1])
-    new_balance = _money_change(message.from_user.id, amount)
-
-    bot.send_message(
-        message.chat.id,
-        f"💰 Тебе выдано <b>+{amount:,} ₽</b>.\n"
-        f"Баланс: <b>{new_balance:,.2f} ₽</b>",
-    )
-
 # ── BERLIONS SOCIAL SYSTEM ────────────────────────────────────────────────────
 # Профили, активность, награды, браки, кланы и безопасные ролевые команды.
 
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 SOCIAL_DB = "social.db"
 SOCIAL_GRAPH_DIR = "social_graphs"
@@ -1955,11 +1670,6 @@ def handle_social_commands(message: Message) -> None:
         "• <code>топ дня</code>\n"
         "• <code>топ неделя</code>\n"
         "• <code>топ месяц</code>\n\n"
-        "💰 <b>Деньги</b>\n"
-        "• <code>/баланс</code> — мой баланс\n"
-        "• <code>/бонус</code> — ежедневный бонус\n"
-        "• <code>/работа</code> — заработать раз в 30 минут\n"
-        "• <code>/топденьги</code> — топ игроков по деньгам\n\n"
         "🎲 <code>/кости</code> — кости\n"
         "🔎 <code>/поиск запрос</code> — поиск\n\n"
         "💡 Основные функции доступны через меню-кнопки под полем ввода."
@@ -2402,10 +2112,459 @@ def handle_social_roleplay(message: Message) -> None:
     bot.send_message(message.chat.id, text)
 
 
+
+# ── АДМИНСКИЕ КОМАНДЫ: РАССЫЛКА И МОДЕРАЦИЯ ─────────────────────────────────────
+MODERATION_DB = "moderation.db"
+BANLIST_PAGE_SIZE = 20
+
+
+def _moderation_db():
+    conn = sqlite3.connect(MODERATION_DB, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _moderation_init_db() -> None:
+    conn = _moderation_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bans (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            reason TEXT NOT NULL DEFAULT 'Не указана',
+            banned_at TEXT NOT NULL,
+            until_ts INTEGER,
+            PRIMARY KEY(chat_id, user_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'Не указана',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+_moderation_init_db()
+
+
+def _remember_broadcast_user(message: Message) -> None:
+    """Запоминаем пользователей, с которыми бот реально может связаться в ЛС."""
+    if not message.from_user or message.chat.type != "private":
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    u = message.from_user
+    conn = _moderation_db()
+    conn.execute("""
+        INSERT INTO broadcast_users(user_id,username,first_name,last_name,first_seen,last_seen)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_name=excluded.last_name,
+            last_seen=excluded.last_seen
+    """, (u.id, u.username, u.first_name or "", u.last_name or "", now, now))
+    conn.commit()
+    conn.close()
+
+
+def _mod_admin(message: Message) -> bool:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ <b>Эта команда доступна только администраторам.</b>")
+        return False
+    return True
+
+
+def _mod_group(message: Message) -> bool:
+    if message.chat.type not in ("group", "supergroup"):
+        bot.send_message(message.chat.id, "⛔ <b>Эта команда работает только в группе.</b>")
+        return False
+    return True
+
+
+def _mod_target(message: Message, args: str = ""):
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+    parts = (args or "").split()
+    if not parts:
+        return None
+    token = parts[0].strip().rstrip(",.!?")
+    if token.isdigit():
+        try:
+            member = bot.get_chat_member(message.chat.id, int(token))
+            return member.user
+        except Exception:
+            return None
+    if token.startswith("@"):
+        try:
+            member = bot.get_chat_member(message.chat.id, token)
+            return member.user
+        except Exception:
+            pass
+        target_id = _social_target(message, token)
+        if target_id:
+            try:
+                member = bot.get_chat_member(message.chat.id, target_id)
+                return member.user
+            except Exception:
+                return None
+    return None
+
+
+def _mod_reason(text: str, target_token_count: int = 0) -> str:
+    parts = (text or "").split()
+    if target_token_count:
+        parts = parts[target_token_count:]
+    return " ".join(parts).strip() or "Не указана"
+
+
+def _parse_duration(text: str):
+    """Возвращает (секунды, красивый текст) для 20 дней / 5 часов / 30 минут."""
+    m = re.match(r"^\s*(\d+)\s*(мин(?:ут[а-я]*)?|ч(?:ас(?:а|ов)?)?|д(?:ень|ня|ней)?|нед(?:ел[яьи])?)\b", text or "", re.I)
+    if not m:
+        return None, None
+    amount = int(m.group(1))
+    unit = m.group(2).lower()
+    if amount <= 0:
+        return None, None
+    if unit.startswith("мин"):
+        seconds = amount * 60
+        label = f"{amount} мин."
+    elif unit.startswith("ч"):
+        seconds = amount * 3600
+        label = f"{amount} ч."
+    elif unit.startswith("нед"):
+        seconds = amount * 7 * 86400
+        label = f"{amount} нед."
+    else:
+        seconds = amount * 86400
+        label = f"{amount} дн."
+    return seconds, label
+
+
+def _mod_target_from_command(message: Message, raw: str):
+    target = _mod_target(message, raw)
+    if target:
+        return target
+    return None
+
+
+def _mod_reason_after_target_and_duration(message: Message, raw: str, has_reply: bool):
+    parts = (raw or "").split()
+    offset = 0 if has_reply else 1
+    if not has_reply:
+        if not parts:
+            return "Не указана", ""
+        offset = 1
+    duration_text = " ".join(parts[offset:])
+    duration_seconds, duration_label = _parse_duration(duration_text)
+    if duration_seconds is None:
+        return "Не указана", ""
+    dur_match = re.match(r"^\s*\d+\s*\S+\s*(.*)$", duration_text, re.I)
+    reason = (dur_match.group(1).strip() if dur_match else "") or "Не указана"
+    return reason, duration_label
+
+
+def _mod_name(user) -> str:
+    if getattr(user, "username", None):
+        return "@" + user.username
+    return user.first_name or "Пользователь"
+
+
+def _mod_bold(text: str) -> str:
+    return f"<b>{html.escape(text)}</b>"
+
+
+def _ban_user_record(chat_id: int, user, reason: str, until_ts: int | None) -> None:
+    conn = _moderation_db()
+    conn.execute("""
+        INSERT INTO bans(chat_id,user_id,username,first_name,reason,banned_at,until_ts)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(chat_id,user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            reason=excluded.reason,
+            banned_at=excluded.banned_at,
+            until_ts=excluded.until_ts
+    """, (chat_id, user.id, user.username, user.first_name or "", reason,
+          datetime.now().isoformat(timespec="seconds"), until_ts))
+    conn.commit()
+    conn.close()
+
+
+def _cleanup_expired_bans(chat_id: int) -> None:
+    now = int(time.time())
+    conn = _moderation_db()
+    conn.execute("DELETE FROM bans WHERE chat_id=? AND until_ts IS NOT NULL AND until_ts<=?", (chat_id, now))
+    conn.commit()
+    conn.close()
+
+
+def _banlist_page(chat_id: int, page: int):
+    _cleanup_expired_bans(chat_id)
+    conn = _moderation_db()
+    total = conn.execute("SELECT COUNT(*) FROM bans WHERE chat_id=?", (chat_id,)).fetchone()[0]
+    rows = conn.execute("""
+        SELECT * FROM bans WHERE chat_id=? ORDER BY banned_at DESC LIMIT ? OFFSET ?
+    """, (chat_id, BANLIST_PAGE_SIZE, page * BANLIST_PAGE_SIZE)).fetchall()
+    conn.close()
+    return rows, int(total)
+
+
+def _banlist_markup(page: int, total: int):
+    markup = InlineKeyboardMarkup()
+    pages = max(1, (total + BANLIST_PAGE_SIZE - 1) // BANLIST_PAGE_SIZE)
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("◀️", callback_data=f"banlist:{page-1}"))
+    if page + 1 < pages:
+        buttons.append(InlineKeyboardButton("▶️", callback_data=f"banlist:{page+1}"))
+    if buttons:
+        markup.row(*buttons)
+    return markup
+
+
+def _render_banlist(chat_id: int, page: int) -> str:
+    rows, total = _banlist_page(chat_id, page)
+    pages = max(1, (total + BANLIST_PAGE_SIZE - 1) // BANLIST_PAGE_SIZE)
+    lines = [f"🚫 <b>БАН-ЛИСТ</b> · страница {page + 1}/{pages}", ""]
+    if not rows:
+        lines.append("Пока здесь пусто.")
+        return "\n".join(lines)
+    for index, row in enumerate(rows, page * BANLIST_PAGE_SIZE + 1):
+        name = "@" + row["username"] if row["username"] else (row["first_name"] or f"ID {row['user_id']}")
+        if row["until_ts"]:
+            left = max(0, int(row["until_ts"]) - int(time.time()))
+            if left >= 86400:
+                until = f"{left // 86400} дн."
+            elif left >= 3600:
+                until = f"{left // 3600} ч."
+            else:
+                until = f"{max(1, left // 60)} мин."
+        else:
+            until = "навсегда"
+        lines.append(f"<b>{index}.</b> {_mod_bold(name)} — до <b>{until}</b>\n└ причина: {html.escape(row['reason'])}")
+    return "\n".join(lines)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/рассылка(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_broadcast(message: Message) -> None:
+    if not _mod_admin(message):
+        return
+    text = (message.text or "").split(maxsplit=1)
+    if len(text) < 2 or not text[1].strip():
+        bot.send_message(message.chat.id, "❓ Формат: <code>/рассылка текст сообщения</code>")
+        return
+    broadcast_text = text[1].strip()
+    conn = _moderation_db()
+    users = conn.execute("SELECT user_id FROM broadcast_users ORDER BY user_id").fetchall()
+    conn.close()
+    if not users:
+        bot.send_message(message.chat.id, "📭 <b>Пока нет пользователей, которым можно сделать рассылку.</b>")
+        return
+    sent = failed = 0
+    for row in users:
+        try:
+            bot.send_message(int(row["user_id"]), broadcast_text)
+            sent += 1
+        except Exception:
+            failed += 1
+    bot.send_message(message.chat.id, f"📢 <b>Рассылка завершена.</b>\n\n✅ Отправлено: <b>{sent}</b>\n❌ Не доставлено: <b>{failed}</b>")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/банлист(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_banlist(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    text = _render_banlist(message.chat.id, 0)
+    rows, total = _banlist_page(message.chat.id, 0)
+    bot.send_message(message.chat.id, text, reply_markup=_banlist_markup(0, total))
+
+
+def _moderation_action_message(message: Message, action: str, target, duration_label: str | None, reason: str):
+    target_name = _mod_bold(_mod_name(target))
+    reason_text = html.escape(reason or "Не указана")
+    if action == "бан":
+        duration_text = duration_label or "навсегда"
+        text = f"🚫 <b>БАН</b>\n\n{target_name} <b>заблокирован на {html.escape(duration_text)}</b>.\n<b>Причина:</b> {reason_text}"
+    elif action == "мут":
+        duration_text = duration_label or "навсегда"
+        text = f"🔇 <b>МУТ</b>\n\n{target_name} <b>лишён возможности писать на {html.escape(duration_text)}</b>.\n<b>Причина:</b> {reason_text}"
+    elif action == "варн":
+        text = f"⚠️ <b>ВАРН</b>\n\n{target_name} получил <b>предупреждение</b>.\n<b>Причина:</b> {reason_text}"
+    else:
+        text = f"👢 <b>КИК</b>\n\n{target_name} <b>исключён из чата</b>.\n<b>Причина:</b> {reason_text}"
+    bot.send_message(message.chat.id, text)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/(бан|мут)(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_ban_mute(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    cmd, *rest = (message.text or "").split(maxsplit=1)
+    raw = rest[0] if rest else ""
+    target = _mod_target(message, raw)
+    if not target or target.id in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    reason, duration_label = _mod_reason_after_target_and_duration(message, raw, bool(message.reply_to_message))
+    if duration_label is None:
+        bot.send_message(message.chat.id, "❓ Формат: <code>/бан 20 дней причина</code> ответом на сообщение пользователя.")
+        return
+    seconds = _parse_duration(" ".join((raw.split()[0:] if not message.reply_to_message else raw.split())))[0]
+    if message.reply_to_message:
+        duration_seconds, _ = _parse_duration(raw)
+    else:
+        parts = raw.split()
+        duration_seconds, _ = _parse_duration(" ".join(parts[1:]))
+    until_ts = int(time.time()) + int(duration_seconds)
+    until_dt = __import__("datetime").datetime.fromtimestamp(until_ts, __import__("datetime").timezone.utc)
+    try:
+        if cmd.lower() == "/бан":
+            bot.ban_chat_member(message.chat.id, target.id, until_date=until_dt, revoke_messages=True)
+            _ban_user_record(message.chat.id, target, reason, until_ts)
+        else:
+            bot.restrict_chat_member(message.chat.id, target.id, until_date=until_dt, can_send_messages=False, can_send_audios=False, can_send_documents=False, can_send_photos=False, can_send_videos=False, can_send_video_notes=False, can_send_voice_notes=False, can_send_polls=False, can_send_other_messages=False)
+        _moderation_action_message(message, "бан" if cmd.lower() == "/бан" else "мут", target, duration_label, reason)
+    except Exception as exc:
+        bot.send_message(message.chat.id, f"❌ <b>Не удалось применить наказание.</b>\n{html.escape(str(exc))}")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/раз(бан|мут)(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_unban_unmute(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    target = _mod_target(message, raw)
+    if not target:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на сообщение или через @username.</b>")
+        return
+    try:
+        if (message.text or "").lower().startswith("/разбан"):
+            bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
+            conn = _moderation_db(); conn.execute("DELETE FROM bans WHERE chat_id=? AND user_id=?", (message.chat.id, target.id)); conn.commit(); conn.close()
+            bot.send_message(message.chat.id, f"✅ <b>РАЗБАН</b>\n\n{_mod_bold(_mod_name(target))} <b>разблокирован.</b>")
+        else:
+            bot.restrict_chat_member(message.chat.id, target.id, can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True)
+            bot.send_message(message.chat.id, f"🔊 <b>РАЗМУТ</b>\n\n{_mod_bold(_mod_name(target))} <b>снова может писать.</b>")
+    except Exception as exc:
+        bot.send_message(message.chat.id, f"❌ <b>Не удалось выполнить команду.</b>\n{html.escape(str(exc))}")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/варн(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_warn(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    target = _mod_target(message, raw)
+    if not target or target.id in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    if message.reply_to_message:
+        reason = raw.strip() or "Не указана"
+    else:
+        reason = " ".join(raw.split()[1:]).strip() if raw.split() and raw.split()[0].startswith("@") else raw.strip()
+        if raw.split() and raw.split()[0].isdigit():
+            reason = " ".join(raw.split()[1:]).strip()
+        reason = reason or "Не указана"
+    conn = _moderation_db()
+    conn.execute("INSERT INTO warnings(chat_id,user_id,reason,created_at) VALUES(?,?,?,?)", (message.chat.id,target.id,reason,datetime.now().isoformat(timespec="seconds")))
+    count = conn.execute("SELECT COUNT(*) FROM warnings WHERE chat_id=? AND user_id=?", (message.chat.id,target.id)).fetchone()[0]
+    conn.commit(); conn.close()
+    if count >= 3:
+        try:
+            until_ts = int(time.time()) + 7 * 86400
+            until_dt = __import__("datetime").datetime.fromtimestamp(until_ts, __import__("datetime").timezone.utc)
+            bot.ban_chat_member(message.chat.id, target.id, until_date=until_dt, revoke_messages=False)
+            _ban_user_record(message.chat.id, target, f"3/3 варнов. Последняя причина: {reason}", until_ts)
+            bot.send_message(message.chat.id, f"🚫 <b>АВТОБАН</b>\n\n{_mod_bold(_mod_name(target))} получил <b>3 варна</b> и заблокирован на <b>7 дн.</b>\n<b>Причина:</b> {html.escape(reason)}")
+        except Exception as exc:
+            bot.send_message(message.chat.id, f"⚠️ { _mod_bold(_mod_name(target)) } получил <b>{count}/3 варна</b>.\n❌ Автобан не удалось применить: {html.escape(str(exc))}")
+    else:
+        _moderation_action_message(message, "варн", target, None, reason)
+        bot.send_message(message.chat.id, f"📊 Сейчас: <b>{count}/3 варна</b>")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/снятьварн(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_remove_warn(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    target = _mod_target(message, raw)
+    if not target:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на сообщение или через @username.</b>")
+        return
+    conn = _moderation_db()
+    row = conn.execute("SELECT id FROM warnings WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT 1", (message.chat.id,target.id)).fetchone()
+    if row:
+        conn.execute("DELETE FROM warnings WHERE id=?", (row["id"],)); conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM warnings WHERE chat_id=? AND user_id=?", (message.chat.id,target.id)).fetchone()[0]
+    conn.close()
+    if not row:
+        bot.send_message(message.chat.id, f"ℹ️ У {_mod_bold(_mod_name(target))} нет варнов.")
+        return
+    bot.send_message(message.chat.id, f"✅ <b>ВАРН СНЯТ</b>\n\n{_mod_bold(_mod_name(target))} — теперь <b>{count}/3</b> варна.")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/кик(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_kick(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    target = _mod_target(message, raw)
+    if not target or target.id in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    reason = raw.strip() if message.reply_to_message else " ".join(raw.split()[1:]).strip()
+    reason = reason or "Не указана"
+    try:
+        bot.ban_chat_member(message.chat.id, target.id, revoke_messages=False)
+        bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
+        _moderation_action_message(message, "кик", target, None, reason)
+    except Exception as exc:
+        bot.send_message(message.chat.id, f"❌ <b>Не удалось исключить пользователя.</b>\n{html.escape(str(exc))}")
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("banlist:")))
+def handle_banlist_callback(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Только для админов", show_alert=True)
+        return
+    try:
+        page = max(0, int(call.data.split(":", 1)[1]))
+    except Exception:
+        bot.answer_callback_query(call.id, "Ошибка страницы", show_alert=True)
+        return
+    text = _render_banlist(call.message.chat.id, page)
+    _, total = _banlist_page(call.message.chat.id, page)
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=_banlist_markup(page, total))
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
 # Последний обработчик сообщений: собирает активность, не перехватывая уже обработанные команды.
 @bot.message_handler(content_types=["text"])
 def handle_social_activity_tracker(message: Message) -> None:
     try:
+        _remember_broadcast_user(message)
         _social_register(message)
     except Exception:
         logger.exception("Social activity tracker error")
