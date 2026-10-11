@@ -746,11 +746,18 @@ def handle_menu_profile(message: Message) -> None:
     handle_social_profile(message)
 
 
-@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "🔥 Самая разыскиваемая"), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(
+    m.chat.type == "private" and m.text and
+    m.text.strip().casefold().endswith("самая разыскиваемая")
+), content_types=["text"])
 def handle_menu_most_wanted(message: Message) -> None:
-    if not _require_subscription(message.chat.id, message.from_user.id, "most_wanted"):
-        return
-    _send_most_wanted(message.chat.id)
+    try:
+        if not _require_subscription(message.chat.id, message.from_user.id, "most_wanted"):
+            return
+        _send_most_wanted(message.chat.id)
+    except Exception as exc:
+        logger.exception("Most wanted menu error")
+        bot.send_message(message.chat.id, f"❌ Не удалось открыть список разыскиваемых игр.\n<code>{html.escape(str(exc))}</code>")
 
 
 @bot.message_handler(commands=["топигр", "mostwanted", "разыскиваемые"])
@@ -2187,10 +2194,24 @@ def _remember_broadcast_user(message: Message) -> None:
 
 
 def _mod_admin(message: Message) -> bool:
-    if not _is_admin(message.from_user.id):
+    """Проверяет право на модерацию: глобальный админ или реальный админ группы."""
+    user_id = message.from_user.id
+    if user_id in ADMIN_IDS:
+        return True
+
+    if message.chat.type not in ("group", "supergroup"):
         bot.send_message(message.chat.id, "⛔ <b>Эта команда доступна только администраторам.</b>")
         return False
-    return True
+
+    try:
+        member = bot.get_chat_member(message.chat.id, user_id)
+        if member.status in ("creator", "administrator"):
+            return True
+    except Exception as exc:
+        logger.warning("Moderation admin check failed for %s: %s", user_id, exc)
+
+    bot.send_message(message.chat.id, "⛔ <b>Эта команда доступна только администраторам.</b>")
+    return False
 
 
 def _mod_group(message: Message) -> bool:
@@ -2415,7 +2436,7 @@ def _moderation_action_message(message: Message, action: str, target, duration_l
     bot.send_message(message.chat.id, text)
 
 
-@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/(бан|мут)(?:\s|$)", m.text, re.I)), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/(бан|мут)(?:@\w+)?(?:\s|$)", m.text, re.I)), content_types=["text"])
 def handle_ban_mute(message: Message) -> None:
     if not _mod_admin(message) or not _mod_group(message):
         return
@@ -2426,21 +2447,32 @@ def handle_ban_mute(message: Message) -> None:
         bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
         return
     reason, duration_label = _mod_reason_after_target_and_duration(message, raw, bool(message.reply_to_message))
-    if duration_label is None:
-        bot.send_message(message.chat.id, "❓ Формат: <code>/бан 20 дней причина</code> ответом на сообщение пользователя.")
-        return
-    seconds = _parse_duration(" ".join((raw.split()[0:] if not message.reply_to_message else raw.split())))[0]
+
+    # Без указанного срока наказание считается бессрочным.
+    # Раньше здесь получался int(None), из-за чего /бан и /мут ответом
+    # на сообщение могли молча падать до блока try/except.
     if message.reply_to_message:
-        duration_seconds, _ = _parse_duration(raw)
+        duration_seconds, parsed_label = _parse_duration(raw)
     else:
         parts = raw.split()
-        duration_seconds, _ = _parse_duration(" ".join(parts[1:]))
-    until_ts = int(time.time()) + int(duration_seconds)
-    until_dt = __import__("datetime").datetime.fromtimestamp(until_ts, __import__("datetime").timezone.utc)
+        duration_seconds, parsed_label = _parse_duration(" ".join(parts[1:])) if len(parts) > 1 else (None, None)
+
+    if duration_seconds is None:
+        duration_label = "навсегда"
+        until_dt = None
+        until_ts = None
+    else:
+        duration_label = parsed_label or duration_label
+        until_ts = int(time.time()) + int(duration_seconds)
+        until_dt = __import__("datetime").datetime.fromtimestamp(until_ts, __import__("datetime").timezone.utc)
+
     try:
         if cmd.lower() == "/бан":
-            bot.ban_chat_member(message.chat.id, target.id, until_date=until_dt, revoke_messages=True)
-            _ban_user_record(message.chat.id, target, reason, until_ts)
+            ban_kwargs = {"revoke_messages": True}
+            if until_dt is not None:
+                ban_kwargs["until_date"] = until_dt
+            bot.ban_chat_member(message.chat.id, target.id, **ban_kwargs)
+            _ban_user_record(message.chat.id, target, reason, until_ts or 0)
         else:
             mute_permissions = ChatPermissions(
                 can_send_messages=False,
@@ -2453,13 +2485,16 @@ def handle_ban_mute(message: Message) -> None:
                 can_send_polls=False,
                 can_add_web_page_previews=False,
             )
-            bot.restrict_chat_member(message.chat.id, target.id, until_date=until_dt, permissions=mute_permissions)
+            mute_kwargs = {"permissions": mute_permissions}
+            if until_dt is not None:
+                mute_kwargs["until_date"] = until_dt
+            bot.restrict_chat_member(message.chat.id, target.id, **mute_kwargs)
         _moderation_action_message(message, "бан" if cmd.lower() == "/бан" else "мут", target, duration_label, reason)
     except Exception as exc:
         bot.send_message(message.chat.id, f"❌ <b>Не удалось применить наказание.</b>\n{html.escape(str(exc))}")
 
 
-@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/раз(бан|мут)(?:\s|$)", m.text, re.I)), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/раз(бан|мут)(?:@\w+)?(?:\s|$)", m.text, re.I)), content_types=["text"])
 def handle_unban_unmute(message: Message) -> None:
     if not _mod_admin(message) or not _mod_group(message):
         return
