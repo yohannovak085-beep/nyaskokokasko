@@ -13,11 +13,13 @@ so it can check member status via getChatMember.
 import os
 import time
 import html
+import io
+import random
 import logging
+import sqlite3
 from dotenv import load_dotenv
 import telebot
 from telebot.types import (
-    ChatPermissions,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     InputMediaPhoto,
@@ -25,6 +27,10 @@ from telebot.types import (
     InputMediaDocument,
     Message,
     CallbackQuery,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    KeyboardButton,
+    ChatPermissions,
 )
 from telebot.apihelper import ApiTelegramException
 
@@ -35,7 +41,7 @@ _dice_cooldown: dict[int, float] = {}
 
 load_dotenv()
 
-BOT_TOKEN = "<SET_IN_ENVIRONMENT>"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "")
 GROUPS_FILE = "groups.json" # Файл для хранения ID групп
 
@@ -67,12 +73,228 @@ logger.info("Admin IDs: %s", ADMIN_IDS)
 telebot.apihelper.ENABLE_MIDDLEWARE = True
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-database.init_db()
+
+# ── Telegram Premium / Custom Emoji ───────────────────────────────────────────
+# ID берём из реальных сообщений Telegram, поэтому здесь НЕТ выдуманных ID.
+# После получения ID достаточно заполнить словарь ниже — весь бот использует
+# единый слой и не требует переписывать десятки сообщений вручную.
+PREMIUM_EMOJI_IDS: dict[str, str] = {
+    # Premium-эмодзи для RP/социалки.
+    # Выбраны из присланного набора; остальная логика бота не меняется.
+    "love": "5373052620426484968",       # 🩷🩷
+    "kiss": "5373081078879786984",       # 🩷🥰
+    "hug": "5235592402571391050",        # 🥰🤍
+    "highfive": "5373092851385148996",   # 😎🥰
+    "handshake": "5341688561617893144",  # 😁🤔
+    "drink": "5357306999736410502",      # ☺️
+    "food": "5373212659497866476",       # 🩷😂
+    "dinner": "5395808113074914549",     # 🥰☺
+    "hit": "5373090308764505856",        # 😔🔪
+}
+
+def _pe(key: str, fallback: str) -> str:
+    """Возвращает Telegram Custom Emoji, а при отсутствии ID — обычный emoji."""
+    emoji_id = str(PREMIUM_EMOJI_IDS.get(key, "") or "").strip()
+    if not emoji_id.isdigit():
+        return fallback
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+def _extract_custom_emoji_ids(message: Message) -> list[tuple[str, str]]:
+    """Достаёт (альтернативный emoji, custom_emoji_id) из текста сообщения."""
+    found = []
+    entities = list(message.entities or [])
+    for entity in entities:
+        if getattr(entity, "type", None) != "custom_emoji":
+            continue
+        cid = getattr(entity, "custom_emoji_id", None)
+        if not cid:
+            continue
+        # get_entity_text учитывает UTF-16 offsets, в отличие от простого среза Python.
+        try:
+            raw = message.text or ""
+            value = raw[entity.offset: entity.offset + entity.length]
+        except Exception:
+            value = "🧩"
+        found.append((value or "🧩", str(cid)))
+    return found
+
 
 # ── In-memory conversation state ──────────────────────────────────────────────
 
 _pending: dict[int, dict] = {}
+_order_pending: dict[int, int] = {}  # user_id -> chat_id, пока пользователь вводит заказ
 _stupid_stats: dict[int, dict] = {} # пока не используется, но оставлено по структуре
+
+# ── BERLIONS GAME REQUESTS ─────────────────────────────────────────────────────
+# Отдельная БД: не смешиваем заказы с основной БД игр/контента.
+ORDERS_DB = "orders.db"
+RANDOM_GAME_COOLDOWN = 30 * 60
+
+def _orders_db():
+    conn = sqlite3.connect(ORDERS_DB, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+def _orders_init_db() -> None:
+    conn = _orders_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS game_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        name_key TEXT NOT NULL UNIQUE,
+        first_user_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open'
+    );
+    CREATE INDEX IF NOT EXISTS idx_game_requests_status ON game_requests(status);
+    CREATE TABLE IF NOT EXISTS game_request_votes (
+        request_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        vote INTEGER NOT NULL CHECK(vote IN (-1, 1)),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(request_id, user_id),
+        FOREIGN KEY(request_id) REFERENCES game_requests(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS random_game_cooldowns (
+        user_id INTEGER PRIMARY KEY,
+        last_used REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS game_search_users (
+        game_key TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        game_name TEXT NOT NULL,
+        found_at TEXT NOT NULL,
+        PRIMARY KEY(game_key, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_game_search_users_game ON game_search_users(game_key);
+    """)
+    conn.commit()
+    conn.close()
+
+_orders_init_db()
+
+def _normalize_game_name(name: str) -> str:
+    # Нормализация нужна, чтобы Minecraft / minecraft /  Minecraft  не создавали дубли.
+    return " ".join(name.casefold().split())
+
+def _menu_keyboard() -> ReplyKeyboardMarkup:
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, row_width=2)
+    markup.add(
+        KeyboardButton("📝 Заказать игру"),
+        KeyboardButton("📋 Стол заказов"),
+        KeyboardButton("🎲 Рандомная игра"),
+        KeyboardButton("👤 Профиль"),
+        KeyboardButton("🔥 Самая разыскиваемая"),
+    )
+    return markup
+
+
+def _record_game_searches(user_id: int, rows) -> None:
+    """Записывает уникальных пользователей, которые нашли игру через /поиск или /search."""
+    if not rows:
+        return
+    now = datetime.now().isoformat(timespec="seconds") if 'datetime' in globals() else time.strftime("%Y-%m-%d %H:%M:%S")
+    conn = _orders_db()
+    try:
+        conn.executemany(
+            "INSERT OR IGNORE INTO game_search_users(game_key,user_id,game_name,found_at) VALUES(?,?,?,?)",
+            [(str(row["key"]), int(user_id), str(row["content_text"]), now) for row in rows[:15]],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _send_most_wanted(chat_id: int) -> None:
+    """Показывает топ игр по числу уникальных пользователей, нашедших их через поиск."""
+    conn = _orders_db()
+    rows = conn.execute("""
+        SELECT game_key, MAX(game_name) AS game_name, COUNT(*) AS users, MAX(found_at) AS last_found
+        FROM game_search_users
+        GROUP BY game_key
+        ORDER BY users DESC, last_found DESC, game_name COLLATE NOCASE ASC
+        LIMIT 10
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        bot.send_message(
+            chat_id,
+            "🔥 <b>Самая разыскиваемая игра</b>\n\n"
+            "Пока статистики нет. Найди игру через <code>/поиск название</code> — и она появится здесь!",
+        )
+        return
+
+    lines = [
+        "🔥 <b>САМЫЕ РАЗЫСКИВАЕМЫЕ ИГРЫ</b>",
+        "",
+        "Рейтинг по количеству <b>уникальных пользователей</b>, которые нашли игру через поиск:",
+        "",
+    ]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, row in enumerate(rows, 1):
+        prefix = medals[i - 1] if i <= 3 else f"<b>{i}.</b>"
+        n = int(row["users"])
+        word = "человек" if n == 1 else ("человека" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "человек")
+        lines.append(f"{prefix} 🎮 <b>{html.escape(str(row['game_name']))}</b> — 👥 <b>{n}</b> {word}")
+
+    bot.send_message(chat_id, "\n".join(lines))
+
+def _send_main_menu(chat_id: int, text: str | None = None, private_only: bool = True) -> None:
+    # Главная Reply-клавиатура Berlions должна существовать ТОЛЬКО в личке с ботом.
+    # В группе Telegram может сохранить ранее отправленную клавиатуру, поэтому
+    # при вызове из группы явно отправляем ReplyKeyboardRemove.
+    if not private_only:
+        bot.send_message(
+            chat_id,
+            text or "ℹ️ Главное меню доступно только в личных сообщениях с ботом.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    bot.send_message(
+        chat_id,
+        text or f"{_pe('game', '🎮')} <b>Главное меню Berlions</b>\nВыбирай нужное действие ниже 👇",
+        reply_markup=_menu_keyboard(),
+    )
+
+def _order_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    conn = _orders_db()
+    row = conn.execute("""
+        SELECT
+            COALESCE(SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END),0) likes,
+            COALESCE(SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END),0) dislikes
+        FROM game_request_votes WHERE request_id=?
+    """, (request_id,)).fetchone()
+    conn.close()
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(f"👍 Хочу {int(row['likes'])}", callback_data=f"order_vote:+:{request_id}"),
+        InlineKeyboardButton(f"👎 Не жду {int(row['dislikes'])}", callback_data=f"order_vote:-:{request_id}"),
+    )
+    return markup
+
+def _request_summary(request_id: int) -> str:
+    conn = _orders_db()
+    row = conn.execute("SELECT name,status,created_at FROM game_requests WHERE id=?", (request_id,)).fetchone()
+    votes = conn.execute("""
+        SELECT
+            COALESCE(SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END),0) likes,
+            COALESCE(SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END),0) dislikes,
+            COUNT(*) total
+        FROM game_request_votes WHERE request_id=?
+    """, (request_id,)).fetchone()
+    conn.close()
+    if not row:
+        return "❌ Заказ не найден."
+    status = "🟢 открыт" if row['status'] == 'open' else "✅ добавлена"
+    return (
+        f"🎮 <b>{html.escape(row['name'])}</b>\n"
+        f"{status} · 👥 ждут: <b>{int(votes['total'])}</b>\n"
+        f"👍 <b>{int(votes['likes'])}</b>   👎 <b>{int(votes['dislikes'])}</b>"
+    )
 
 # ── Subscription gate (Двойная проверка подписки на канал И чат) ───────────────
 
@@ -217,1003 +439,6 @@ def _bot_username() -> str:
 def _deep_link(key: str) -> str:
     return f"https://t.me/{_bot_username()}?start={key}"
 
-# ── /start (С новым приветствием) ─────────────────────────────────────────────
-
-@bot.message_handler(commands=["start"])
-def handle_start(message: Message) -> None:
-    _pending.pop(message.from_user.id, None)
-
-    username = message.from_user.username if message.from_user.username else "Без никнейма"
-    first_name = message.from_user.first_name
-    logger.info("Пользователь: %s (@%s), ID: %s", first_name, username, message.from_user.id)
-
-    text = message.text.strip()
-    parts = text.split(maxsplit=1)
-    key = parts[1].strip() if len(parts) > 1 else None
-
-    if not key:
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🎲 Сыграть в кости", callback_data="play_dice"))
-        
-        user_display = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
-        
-        user_display = html.escape(str(user_display))
-        welcome_text = (
-            f"👋 <b>Привет! Я Berlions чат-бот.</b>\n\n"
-            f"📋 <b>Доступные команды:</b>\n"
-            f"• /start — приветствие и главное меню\n"
-            f"• /help — список доступных команд\n"
-            f"• /search <i>запрос</i> — поиск игры или контента\n"
-            f"• /dice — сыграть в кости 🎲\n• /profile — профиль и активность\n• /top — топ активности\n• /topmoney — топ капитала биржи\n\n"
-            f"🔍 <b>Поиск:</b>\n"
-            f"Например: <code>/search standoff 2</code>\n\n"
-            f"🎲 Нажми кнопку ниже, чтобы сразу сыграть."
-        )
-        
-        bot.send_message(message.chat.id, welcome_text, reply_markup=markup)
-        return
-
-    if not _require_subscription(message.chat.id, message.from_user.id, f"key:{key}"): return
-
-    row = database.get_link(key)
-    if row is None:
-        bot.send_message(message.chat.id, "❌ Ссылка не найдена или устарела.")
-        logger.warning("Unknown deep-link key: %r", key)
-        return
-
-    _deliver_link(message.chat.id, row)
-    logger.info("Served key %r to user %s", key, message.from_user.id)
-
-# ── /help ─────────────────────────────────────────────────────────────────────
-
-@bot.message_handler(commands=["help"])
-def handle_help(message: Message) -> None:
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🎲 Сыграть в кости", callback_data="play_dice"))
-    bot.send_message(
-        message.chat.id,
-        "📋 <b>Доступные команды:</b>\n\n"
-        "• /start — главное меню\n"
-        "• /help — список доступных команд\n"
-        "• /search <i>запрос</i> — поиск контента\n"
-        "• /dice — сыграть в кости 🎲\n\n"
-        "Пример поиска: <code>/search minecraft</code>",
-        reply_markup=markup,
-    )
-
-# ── /search (С анимацией и умным поиском) ─────────────────────────────────────
-
-@bot.message_handler(commands=["search"])
-def handle_search(message: Message) -> None:
-    parts = message.text.strip().split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        bot.send_message(
-            message.chat.id,
-            "🔍 <b>Поиск по играм</b>\n\n"
-            "Использование: <code>/search название игры</code>\n\n"
-            "Пример: <code>/search minecraft</code>",
-        )
-        return
-
-    query = parts[1].strip()
-    query_lower = query.lower()
-    
-    # === ХАКЕРСКАЯ АНИМАЦИЯ ИНИЦИАЛИЗАЦИИ ===
-    loader_msg = bot.send_message(
-        message.chat.id,
-        f"<code>> CONNECTING TO BERLIONS_DB...</code>\n"
-        f"<code>[██████░░░░░░░░] 45%</code>\n"
-        f"<i>Ага, ищу таккк, таккк...</i>"
-    )
-    
-    time.sleep(1.0)  # Небольшая пауза для эффекта загрузки
-
-    rows = database.search_links(query) # Получаем все потенциальные результаты
-    
-    # === УМНЫЙ ПОИСК (ФИЛЬТРАЦИЯ) ===
-    filtered_rows = []
-    if len(query) <= 2:
-        # Для коротких запросов ищем только те, что НАЧИНАЮТСЯ с этой буквы/символа
-        filtered_rows = [r for r in rows if r["content_text"].lower().startswith(query_lower)]
-    else:
-        # Для длинных: сначала те, что начинаются на этот текст, потом все остальные совпадения
-        starts = [r for r in rows if r["content_text"].lower().startswith(query_lower)]
-        contains = [r for r in rows if query_lower in r["content_text"].lower() and not r["content_text"].lower().startswith(query_lower)]
-        filtered_rows = starts + contains # Объединяем, сначала "начинающиеся", потом "содержащие"
-
-    _record_game_search(message.chat.id, message.from_user.id, query, filtered_rows)
-
-    if not filtered_rows:
-        bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=loader_msg.message_id,
-            text=f"<code>> SEARCH FAILED</code>\n\n"
-                 f"😔 По запросу <b>«{html.escape(query)}»</b> ничего не найдено.\n\n"
-                 f"Попробуй другое название."
-        )
-        return
-
-    markup = InlineKeyboardMarkup(row_width=1)
-    is_private = message.chat.type == "private"
-
-    for row in filtered_rows[:15]:  # максимум 15 результатов
-        title = row["content_text"]
-        btn_label = title if len(title) <= 60 else title[:57] + "…"
-        
-        if is_private:
-            markup.add(
-                InlineKeyboardButton(
-                    f"🎮 {btn_label}",
-                    callback_data=f"search_pick:{row['key']}",
-                )
-            )
-        else:
-            markup.add(
-                InlineKeyboardButton(
-                    f"🎮 {btn_label}",
-                    url=_deep_link(row["key"]),
-                )
-            )
-
-    count = len(filtered_rows)
-    
-    # === НАШЁЛ И ВЫДАЧА ===
-    bot.edit_message_text(
-        chat_id=message.chat.id,
-        message_id=loader_msg.message_id,
-        text=f"<code>> DATABASE UNLOCKED</code>\n"
-             f"<code>[██████████████] 100%</code>\n\n"
-             f"🔑 <b>НАШЁЛ!</b>\n\n"
-             f"🔍 Результатов по запросу «{html.escape(query)}»: <b>{count}</b>\n"
-             f"Выбери что тебя интересует 👇",
-        reply_markup=markup
-    )
-
-# ── Game search statistics / Most Wanted ─────────────────────────────────────
-# Храним только уникальные поиски пользователя, чтобы повторный /search не накручивал топ.
-GAME_STATS_DB = "game_search_stats.db"
-
-
-def _game_stats_db():
-    conn = sqlite3.connect(GAME_STATS_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _game_stats_init() -> None:
-    conn = _game_stats_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS game_searches (
-            chat_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            game_key TEXT NOT NULL,
-            game_name TEXT NOT NULL,
-            last_search TEXT NOT NULL,
-            PRIMARY KEY (chat_id, user_id, game_key)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def _record_game_search(chat_id: int, user_id: int, query: str, rows) -> None:
-    """Записывает поиск. Если нашли игру в БД — используем её ключ/название."""
-    try:
-        now = datetime.now().isoformat(timespec="seconds")
-        conn = _game_stats_db()
-        if rows:
-            # Один поиск одной игры = один уникальный интерес пользователя.
-            selected = rows[:15]
-            for row in selected:
-                key = str(row["key"])
-                name = str(row["content_text"] or query).strip()[:200]
-                conn.execute(
-                    "INSERT INTO game_searches(chat_id,user_id,game_key,game_name,last_search) "
-                    "VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id,game_key) DO UPDATE SET last_search=excluded.last_search",
-                    (chat_id, user_id, key, name, now),
-                )
-        else:
-            normalized = " ".join(query.lower().split())[:200]
-            if normalized:
-                conn.execute(
-                    "INSERT INTO game_searches(chat_id,user_id,game_key,game_name,last_search) "
-                    "VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id,game_key) DO UPDATE SET last_search=excluded.last_search",
-                    (chat_id, user_id, "query:" + normalized, query[:200], now),
-                )
-        conn.commit()
-        conn.close()
-    except Exception:
-        logger.exception("Game search stats error")
-
-
-def _game_most_wanted(chat_id: int, limit: int = 10):
-    conn = _game_stats_db()
-    rows = conn.execute("""
-        SELECT game_key, game_name, COUNT(DISTINCT user_id) AS users
-        FROM game_searches
-        WHERE chat_id=?
-        GROUP BY game_key, game_name
-        ORDER BY users DESC, game_name COLLATE NOCASE ASC
-        LIMIT ?
-    """, (chat_id, limit)).fetchall()
-    conn.close()
-    return rows
-
-
-_game_stats_init()
-
-
-@bot.message_handler(commands=["топигр", "mostwanted", "разыскиваемые"])
-def handle_game_most_wanted(message: Message) -> None:
-    rows = _game_most_wanted(message.chat.id, 10)
-    if not rows:
-        bot.send_message(message.chat.id, "🔥 <b>Самая разыскиваемая</b>\n\nПока никто не искал игры через /search.")
-        return
-    lines = ["🔥 <b>Самые разыскиваемые игры</b>", "", "Количество — уникальные пользователи, а не повторные запросы:"]
-    for i, row in enumerate(rows, 1):
-        name = html.escape(str(row["game_name"]))
-        users = int(row["users"])
-        lines.append(f"<b>{i}.</b> 🎮 {name} — <b>{users}</b> {'пользователь' if users == 1 else 'пользователей'}")
-    bot.send_message(message.chat.id, "\n".join(lines))
-
-
-# ── BERLIONS EXCHANGE SYSTEM ───────────────────────────────────────────────────
-# Отдельный функциональный блок. Старые функции бота не изменяет.
-
-import sqlite3
-import random
-import struct
-import binascii
-import zlib
-from datetime import datetime, date, timezone
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except ImportError:
-    matplotlib = None
-    plt = None
-
-EXCHANGE_DB = "exchange.db"
-EXCHANGE_GRAPH_DIR = "exchange_graphs"
-EXCHANGE_START_BALANCE = 10_000.0
-EXCHANGE_DAILY_BONUS = 1_000.0
-EXCHANGE_DEFAULT_PRICE = 100.0
-EXCHANGE_DEFAULT_TICKER = "BERL"
-EXCHANGE_MAX_TRADE = 100_000
-
-
-def _ex_db():
-    conn = sqlite3.connect(EXCHANGE_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _ex_init_db():
-    conn = _ex_db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS ex_traders (
-        user_id INTEGER PRIMARY KEY,
-        balance REAL NOT NULL DEFAULT 10000,
-        last_bonus TEXT,
-        market_message_id INTEGER,
-        market_chat_id INTEGER
-    );
-
-    CREATE TABLE IF NOT EXISTS ex_exchanges (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        owner_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        ticker TEXT NOT NULL UNIQUE,
-        price REAL NOT NULL DEFAULT 100,
-        created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS ex_holdings (
-        user_id INTEGER NOT NULL,
-        exchange_id INTEGER NOT NULL,
-        shares INTEGER NOT NULL DEFAULT 0,
-        avg_price REAL NOT NULL DEFAULT 0,
-        PRIMARY KEY (user_id, exchange_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS ex_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        exchange_id INTEGER NOT NULL,
-        price REAL NOT NULL,
-        ts TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS ex_transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        exchange_id INTEGER NOT NULL,
-        action TEXT NOT NULL,
-        shares INTEGER NOT NULL,
-        price REAL NOT NULL,
-        total REAL NOT NULL,
-        ts TEXT NOT NULL
-    );
-    """)
-
-    # Базовая биржа Berlions.
-    row = conn.execute("SELECT id FROM ex_exchanges WHERE ticker=?", (EXCHANGE_DEFAULT_TICKER,)).fetchone()
-    if row is None:
-        cur = conn.execute(
-            "INSERT INTO ex_exchanges(owner_id,name,ticker,price,created_at) VALUES(?,?,?,?,?)",
-            (0, "Berlions", EXCHANGE_DEFAULT_TICKER, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
-        )
-        exchange_id = cur.lastrowid
-        conn.execute(
-            "INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)",
-            (exchange_id, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
-        )
-    conn.commit()
-    conn.close()
-
-
-_ex_init_db()
-
-
-def _ex_ensure_trader(user_id: int):
-    conn = _ex_db()
-    conn.execute("INSERT OR IGNORE INTO ex_traders(user_id,balance) VALUES(?,?)", (user_id, EXCHANGE_START_BALANCE))
-    conn.commit()
-    row = conn.execute("SELECT * FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def _ex_escape(value):
-    return html.escape(str(value))
-
-
-def _ex_change_price(conn, exchange_id: int, action_bias: float = 0.0):
-    row = conn.execute("SELECT price FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
-    if not row:
-        return None, 0.0
-
-    old_price = float(row["price"])
-    shock = random.gauss(0, 0.035) + action_bias
-    shock = max(-0.12, min(0.12, shock))
-    new_price = max(1.0, old_price * (1.0 + shock))
-
-    conn.execute("UPDATE ex_exchanges SET price=? WHERE id=?", (new_price, exchange_id))
-    conn.execute(
-        "INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)",
-        (exchange_id, new_price, datetime.now().isoformat(timespec="seconds")),
-    )
-    return new_price, ((new_price / old_price) - 1.0) * 100.0
-
-
-def _ex_chart(exchange_id: int):
-    """
-    Создаёт PNG-график без matplotlib/Pillow.
-    Использует только стандартную библиотеку Python, поэтому /market
-    работает даже если Bothost не установил дополнительные библиотеки.
-    """
-    import os
-    os.makedirs(EXCHANGE_GRAPH_DIR, exist_ok=True)
-
-    conn = _ex_db()
-    ex = conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
-    rows = conn.execute(
-        "SELECT price,ts FROM ex_history WHERE exchange_id=? ORDER BY id DESC LIMIT 40",
-        (exchange_id,),
-    ).fetchall()
-    conn.close()
-
-    if not ex:
-        raise RuntimeError("Биржа не найдена")
-
-    rows = list(reversed(rows))
-    prices = [float(r["price"]) for r in rows] or [float(ex["price"])]
-    change = ((prices[-1] / prices[0]) - 1.0) * 100.0 if len(prices) > 1 and prices[0] else 0.0
-    path = os.path.join(EXCHANGE_GRAPH_DIR, f"market_{exchange_id}.png")
-
-    # --- PNG рисуем вручную: никаких внешних библиотек не требуется. ---
-    width, height = 1200, 650
-    bg = (17, 24, 39)
-    grid = (55, 65, 81)
-    line_color = (34, 197, 94) if change >= 0 else (239, 68, 68)
-    area_color = (31, 65, 48) if change >= 0 else (70, 35, 42)
-
-    pixels = bytearray(bg * (width * height))
-
-    def set_px(x, y, color):
-        if 0 <= x < width and 0 <= y < height:
-            i = (y * width + x) * 3
-            pixels[i:i + 3] = bytes(color)
-
-    def rect(x1, y1, x2, y2, color):
-        x1, x2 = max(0, int(x1)), min(width - 1, int(x2))
-        y1, y2 = max(0, int(y1)), min(height - 1, int(y2))
-        if x1 > x2 or y1 > y2:
-            return
-        row = bytes(color) * (x2 - x1 + 1)
-        for yy in range(y1, y2 + 1):
-            i = (yy * width + x1) * 3
-            pixels[i:i + len(row)] = row
-
-    def line(x1, y1, x2, y2, color, thickness=3):
-        # DDA — достаточно для простого биржевого графика.
-        steps = max(abs(int(x2) - int(x1)), abs(int(y2) - int(y1)), 1)
-        for s in range(steps + 1):
-            t = s / steps
-            x = round(x1 + (x2 - x1) * t)
-            y = round(y1 + (y2 - y1) * t)
-            r = max(0, thickness // 2)
-            rect(x - r, y - r, x + r, y + r, color)
-
-    margin_left, margin_right = 70, 45
-    margin_top, margin_bottom = 55, 55
-    chart_left = margin_left
-    chart_right = width - margin_right
-    chart_top = margin_top
-    chart_bottom = height - margin_bottom
-
-    # Рамка и сетка.
-    rect(chart_left, chart_top, chart_right, chart_top + 2, grid)
-    rect(chart_left, chart_bottom - 2, chart_right, chart_bottom, grid)
-    rect(chart_left, chart_top, chart_left + 2, chart_bottom, grid)
-    rect(chart_right - 2, chart_top, chart_right, chart_bottom, grid)
-
-    for j in range(1, 5):
-        y = chart_top + (chart_bottom - chart_top) * j / 5
-        rect(chart_left, y, chart_right, y + 1, grid)
-
-    for j in range(1, 6):
-        x = chart_left + (chart_right - chart_left) * j / 6
-        rect(x, chart_top, x + 1, chart_bottom, grid)
-
-    low, high = min(prices), max(prices)
-    if high == low:
-        pad = max(1.0, abs(high) * 0.02)
-        low -= pad
-        high += pad
-    else:
-        pad = (high - low) * 0.08
-        low -= pad
-        high += pad
-
-    points = []
-    denom = max(1, len(prices) - 1)
-    for i, price in enumerate(prices):
-        x = chart_left + (chart_right - chart_left) * i / denom
-        y = chart_bottom - (price - low) / (high - low) * (chart_bottom - chart_top)
-        points.append((x, y))
-
-    # Лёгкая заливка под линией.
-    if points:
-        for i in range(len(points) - 1):
-            x1, y1 = points[i]
-            x2, y2 = points[i + 1]
-            steps = max(1, int(abs(x2 - x1)))
-            for s in range(steps + 1):
-                t = s / steps
-                x = round(x1 + (x2 - x1) * t)
-                y = round(y1 + (y2 - y1) * t)
-                rect(x, min(y, chart_bottom), x + 1, chart_bottom, area_color)
-
-    # Линия курса.
-    for i in range(len(points) - 1):
-        line(*points[i], *points[i + 1], line_color, thickness=7)
-
-    # Последняя точка.
-    if points:
-        x, y = points[-1]
-        rect(x - 7, y - 7, x + 7, y + 7, line_color)
-        rect(x - 3, y - 3, x + 3, y + 3, (255, 255, 255))
-
-    # Заголовок/цифры находятся в caption Telegram, поэтому шрифты не нужны.
-
-    def png_chunk(kind, data):
-        return (
-            struct.pack(">I", len(data))
-            + kind
-            + data
-            + struct.pack(">I", binascii.crc32(kind + data) & 0xffffffff)
-        )
-
-    raw = bytearray()
-    row_bytes = width * 3
-    for y in range(height):
-        raw.append(0)  # filter type
-        start = y * row_bytes
-        raw.extend(pixels[start:start + row_bytes])
-
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-        + png_chunk(b"IEND", b"")
-    )
-
-    with open(path, "wb") as f:
-        f.write(png)
-
-    return path
-
-def _ex_market_text(exchange_id: int):
-    conn = _ex_db()
-    ex = conn.execute("SELECT * FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
-    owner = conn.execute("SELECT user_id FROM ex_traders WHERE user_id=?", (ex["owner_id"],)).fetchone()
-    hist = conn.execute(
-        "SELECT price FROM ex_history WHERE exchange_id=? ORDER BY id DESC LIMIT 2",
-        (exchange_id,),
-    ).fetchall()
-    conn.close()
-
-    current = float(ex["price"])
-    previous = float(hist[1]["price"]) if len(hist) > 1 else current
-    change = ((current / previous) - 1.0) * 100 if previous else 0.0
-    arrow = "📈" if change > 0 else "📉" if change < 0 else "➖"
-
-    return (
-        f"🏦 <b>{_ex_escape(ex['name'])}</b>  <code>${_ex_escape(ex['ticker'])}</code>\n"
-        f"💰 Цена: <b>{current:,.2f} ₽</b>\n"
-        f"{arrow} Изменение: <b>{change:+.2f}%</b>\n"
-        f"👤 Владелец: <code>{ex['owner_id']}</code>\n\n"
-        f"/buy {ex['ticker']} 5 — купить\n"
-        f"/sell {ex['ticker']} 5 — продать\n"
-        f"/portfolio — мой портфель"
-    )
-
-
-def _ex_markup():
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("🔄 Обновить рынок", callback_data="ex_refresh"),
-        InlineKeyboardButton("💼 Портфель", callback_data="ex_portfolio"),
-        InlineKeyboardButton("💰 Бонус", callback_data="ex_bonus"),
-    )
-    return markup
-
-
-def _ex_replace_market(chat_id: int, user_id: int, exchange_id: int = 1):
-    _ex_ensure_trader(user_id)
-    conn = _ex_db()
-    ex = conn.execute("SELECT id FROM ex_exchanges WHERE id=?", (exchange_id,)).fetchone()
-    if not ex:
-        exchange_id = 1
-    old = conn.execute(
-        "SELECT market_message_id,market_chat_id FROM ex_traders WHERE user_id=?",
-        (user_id,),
-    ).fetchone()
-    conn.close()
-
-    if old and old["market_message_id"] and old["market_chat_id"]:
-        try:
-            bot.delete_message(old["market_chat_id"], old["market_message_id"])
-        except Exception:
-            pass
-
-    path = _ex_chart(exchange_id)
-    with open(path, "rb") as photo:
-        msg = bot.send_photo(
-            chat_id,
-            photo,
-            caption=_ex_market_text(exchange_id),
-            reply_markup=_ex_markup(),
-        )
-
-    conn = _ex_db()
-    conn.execute(
-        "UPDATE ex_traders SET market_message_id=?,market_chat_id=? WHERE user_id=?",
-        (msg.message_id, chat_id, user_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def _ex_require_user(message):
-    # Биржа не меняет существующую подписочную логику старых команд.
-    _ex_ensure_trader(message.from_user.id)
-    return True
-
-
-@bot.message_handler(commands=["exchange", "биржа"])
-def handle_exchange(message: Message) -> None:
-    if not _ex_require_user(message):
-        return
-    bot.send_message(
-        message.chat.id,
-        "🏦 <b>BERLIONS STOCK EXCHANGE</b>\n\n"
-        "💰 /bonus — ежедневный бонус 1 000 ₽\n"
-        "💵 /balance — баланс\n"
-        "📈 /market — открыть рынок и график\n"
-        "💼 /portfolio — мои акции\n"
-        "🛒 /buy TICKER 5 — купить акции\n"
-        "💸 /sell TICKER 5 — продать акции\n"
-        "🏭 /create_exchange Название TICKER — создать свою биржу\n"
-        "📋 /exchanges — список бирж\n"
-        "🏆 /top — рейтинг игроков\n\n"
-        "Курс меняется после сделок, а график рынка обновляется автоматически."
-    )
-
-
-@bot.message_handler(commands=["bonus"])
-def handle_exchange_bonus(message: Message) -> None:
-    user_id = message.from_user.id
-    _ex_ensure_trader(user_id)
-    today = date.today().isoformat()
-    conn = _ex_db()
-    row = conn.execute("SELECT balance,last_bonus FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
-    if row["last_bonus"] == today:
-        conn.close()
-        bot.send_message(message.chat.id, "⏳ Ты уже получил ежедневный бонус сегодня. Возвращайся завтра!")
-        return
-    new_balance = float(row["balance"]) + EXCHANGE_DAILY_BONUS
-    conn.execute("UPDATE ex_traders SET balance=?,last_bonus=? WHERE user_id=?", (new_balance, today, user_id))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, f"🎁 <b>Ежедневный бонус!</b>\n\n+{EXCHANGE_DAILY_BONUS:,.0f} ₽\n💰 Баланс: <b>{new_balance:,.2f} ₽</b>")
-
-
-@bot.message_handler(commands=["balance"])
-def handle_exchange_balance(message: Message) -> None:
-    row = _ex_ensure_trader(message.from_user.id)
-    bot.send_message(message.chat.id, f"💰 Твой баланс: <b>{float(row['balance']):,.2f} ₽</b>\n\n🎁 Ежедневный бонус: /bonus")
-
-
-@bot.message_handler(commands=["market"])
-def handle_exchange_market(message: Message) -> None:
-    try:
-        _ex_require_user(message)
-        _ex_replace_market(message.chat.id, message.from_user.id, 1)
-    except Exception as exc:
-        logger.exception("/market error: %s", exc)
-        bot.send_message(
-            message.chat.id,
-            "❌ Не удалось открыть рынок.\n\n"
-            f"Техническая ошибка: <code>{html.escape(str(exc))}</code>"
-        )
-
-
-@bot.message_handler(commands=["portfolio"])
-def handle_exchange_portfolio(message: Message) -> None:
-    user_id = message.from_user.id
-    _ex_ensure_trader(user_id)
-    conn = _ex_db()
-    rows = conn.execute("""
-        SELECT h.shares,h.avg_price,e.name,e.ticker,e.price
-        FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id
-        WHERE h.user_id=? AND h.shares>0 ORDER BY e.ticker
-    """, (user_id,)).fetchall()
-    balance = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()["balance"]
-    conn.close()
-
-    if not rows:
-        bot.send_message(message.chat.id, f"💼 <b>Портфель пуст</b>\n\n💰 Баланс: <b>{float(balance):,.2f} ₽</b>\n\nПопробуй /buy BERL 5")
-        return
-
-    lines = [f"💼 <b>Твой портфель</b>\n💰 Баланс: <b>{float(balance):,.2f} ₽</b>\n"]
-    for r in rows:
-        value = r["shares"] * r["price"]
-        pnl = (r["price"] - r["avg_price"]) * r["shares"]
-        lines.append(f"• <b>{r['ticker']}</b> — {r['shares']} шт. × {r['price']:,.2f} ₽ = {value:,.2f} ₽\n  P/L: {pnl:+,.2f} ₽")
-    bot.send_message(message.chat.id, "\n".join(lines))
-
-
-def _ex_parse_trade(message):
-    parts = (message.text or "").split()
-    if len(parts) != 3 or not parts[2].isdigit():
-        bot.send_message(message.chat.id, "❓ Формат: <code>/buy BERL 5</code>")
-        return None
-    ticker = parts[1].upper()
-    shares = int(parts[2])
-    if shares <= 0 or shares > EXCHANGE_MAX_TRADE:
-        bot.send_message(message.chat.id, f"❌ Количество должно быть от 1 до {EXCHANGE_MAX_TRADE}.")
-        return None
-    return ticker, shares
-
-
-@bot.message_handler(commands=["buy"])
-def handle_exchange_buy(message: Message) -> None:
-    parsed = _ex_parse_trade(message)
-    if not parsed:
-        return
-    ticker, shares = parsed
-    user_id = message.from_user.id
-    _ex_ensure_trader(user_id)
-    conn = _ex_db()
-    ex = conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
-    if not ex:
-        conn.close()
-        bot.send_message(message.chat.id, "❌ Такой акции нет. Посмотри /exchanges")
-        return
-
-    price = float(ex["price"])
-    total = price * shares
-    trader = conn.execute("SELECT balance FROM ex_traders WHERE user_id=?", (user_id,)).fetchone()
-    if float(trader["balance"]) < total:
-        conn.close()
-        bot.send_message(message.chat.id, f"❌ Недостаточно денег. Нужно <b>{total:,.2f} ₽</b>.")
-        return
-
-    holding = conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"])).fetchone()
-    old_shares = int(holding["shares"]) if holding else 0
-    old_avg = float(holding["avg_price"]) if holding else 0.0
-    new_shares = old_shares + shares
-    new_avg = ((old_shares * old_avg) + total) / new_shares
-
-    conn.execute("UPDATE ex_traders SET balance=balance-? WHERE user_id=?", (total, user_id))
-    conn.execute(
-        "INSERT INTO ex_holdings(user_id,exchange_id,shares,avg_price) VALUES(?,?,?,?) "
-        "ON CONFLICT(user_id,exchange_id) DO UPDATE SET shares=excluded.shares,avg_price=excluded.avg_price",
-        (user_id, ex["id"], new_shares, new_avg),
-    )
-    new_price, change = _ex_change_price(conn, ex["id"], min(0.012, shares / 10000.0))
-    conn.execute(
-        "INSERT INTO ex_transactions(user_id,exchange_id,action,shares,price,total,ts) VALUES(?,?,?,?,?,?,?)",
-        (user_id, ex["id"], "BUY", shares, price, total, datetime.now().isoformat(timespec="seconds")),
-    )
-    conn.commit()
-    conn.close()
-
-    bot.send_message(message.chat.id, f"📈 <b>Покупка исполнена</b>\n\n🪙 {shares} × {ticker}\n💵 Цена сделки: {price:,.2f} ₽\n💸 Сумма: {total:,.2f} ₽\n📊 Новый курс: {new_price:,.2f} ₽ ({change:+.2f}%)")
-    try:
-        _ex_replace_market(message.chat.id, user_id, ex["id"])
-    except Exception as exc:
-        logger.exception("Exchange chart error: %s", exc)
-
-
-@bot.message_handler(commands=["sell"])
-def handle_exchange_sell(message: Message) -> None:
-    parsed = _ex_parse_trade(message)
-    if not parsed:
-        return
-    ticker, shares = parsed
-    user_id = message.from_user.id
-    _ex_ensure_trader(user_id)
-    conn = _ex_db()
-    ex = conn.execute("SELECT * FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
-    if not ex:
-        conn.close()
-        bot.send_message(message.chat.id, "❌ Такой акции нет. Посмотри /exchanges")
-        return
-
-    holding = conn.execute("SELECT shares,avg_price FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"])).fetchone()
-    if not holding or int(holding["shares"]) < shares:
-        conn.close()
-        bot.send_message(message.chat.id, "❌ У тебя недостаточно этих акций.")
-        return
-
-    price = float(ex["price"])
-    total = price * shares
-    remaining = int(holding["shares"]) - shares
-    conn.execute("UPDATE ex_traders SET balance=balance+? WHERE user_id=?", (total, user_id))
-    if remaining:
-        conn.execute("UPDATE ex_holdings SET shares=? WHERE user_id=? AND exchange_id=?", (remaining, user_id, ex["id"]))
-    else:
-        conn.execute("DELETE FROM ex_holdings WHERE user_id=? AND exchange_id=?", (user_id, ex["id"]))
-
-    new_price, change = _ex_change_price(conn, ex["id"], -min(0.012, shares / 10000.0))
-    conn.execute(
-        "INSERT INTO ex_transactions(user_id,exchange_id,action,shares,price,total,ts) VALUES(?,?,?,?,?,?,?)",
-        (user_id, ex["id"], "SELL", shares, price, total, datetime.now().isoformat(timespec="seconds")),
-    )
-    conn.commit()
-    conn.close()
-
-    bot.send_message(message.chat.id, f"📉 <b>Продажа исполнена</b>\n\n🪙 {shares} × {ticker}\n💵 Цена сделки: {price:,.2f} ₽\n💰 Получено: {total:,.2f} ₽\n📊 Новый курс: {new_price:,.2f} ₽ ({change:+.2f}%)")
-    try:
-        _ex_replace_market(message.chat.id, user_id, ex["id"])
-    except Exception as exc:
-        logger.exception("Exchange chart error: %s", exc)
-
-
-@bot.message_handler(commands=["create_exchange"])
-def handle_create_exchange(message: Message) -> None:
-    parts = (message.text or "").split()
-    if len(parts) < 3:
-        bot.send_message(message.chat.id, "❓ Формат: <code>/create_exchange MyCompany MYC</code>")
-        return
-    ticker = parts[-1].upper()
-    name = " ".join(parts[1:-1]).strip()
-    if not name or not ticker.isalnum() or not 2 <= len(ticker) <= 8:
-        bot.send_message(message.chat.id, "❌ Название или тикер указаны неправильно. Тикер: 2–8 латинских символов/цифр.")
-        return
-
-    conn = _ex_db()
-    exists = conn.execute("SELECT id FROM ex_exchanges WHERE ticker=?", (ticker,)).fetchone()
-    if exists:
-        conn.close()
-        bot.send_message(message.chat.id, "❌ Такой тикер уже занят.")
-        return
-    cur = conn.execute(
-        "INSERT INTO ex_exchanges(owner_id,name,ticker,price,created_at) VALUES(?,?,?,?,?)",
-        (message.from_user.id, name, ticker, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")),
-    )
-    exchange_id = cur.lastrowid
-    conn.execute("INSERT INTO ex_history(exchange_id,price,ts) VALUES(?,?,?)", (exchange_id, EXCHANGE_DEFAULT_PRICE, datetime.now().isoformat(timespec="seconds")))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, f"🏭 <b>Биржа создана!</b>\n\n🏦 {html.escape(name)}\n📈 Тикер: <code>{ticker}</code>\n💰 Стартовая цена: <b>100 ₽</b>\n\nТеперь игроки могут покупать и продавать <code>{ticker}</code> через /buy и /sell.")
-
-
-@bot.message_handler(commands=["exchanges"])
-def handle_exchanges(message: Message) -> None:
-    conn = _ex_db()
-    rows = conn.execute("SELECT * FROM ex_exchanges ORDER BY id DESC LIMIT 30").fetchall()
-    conn.close()
-    lines = ["🏦 <b>Все биржи</b>\n"]
-    for r in rows:
-        lines.append(f"• <code>{r['ticker']}</code> — {html.escape(r['name'])}: <b>{r['price']:,.2f} ₽</b>\n  Владелец: <code>{r['owner_id']}</code>")
-    bot.send_message(message.chat.id, "\n".join(lines))
-
-
-@bot.message_handler(commands=["topmoney", "toptraders"])
-def handle_exchange_top(message: Message) -> None:
-    conn = _ex_db()
-    traders = conn.execute("SELECT user_id,balance FROM ex_traders").fetchall()
-    result = []
-    for trader in traders:
-        holdings = conn.execute(
-            "SELECT h.shares,e.price FROM ex_holdings h JOIN ex_exchanges e ON e.id=h.exchange_id WHERE h.user_id=?",
-            (trader["user_id"],),
-        ).fetchall()
-        total = float(trader["balance"]) + sum(int(h["shares"]) * float(h["price"]) for h in holdings)
-        result.append((total, trader["user_id"]))
-    conn.close()
-    result.sort(reverse=True)
-    lines = ["🏆 <b>TOP TRADERS</b>\n"]
-    for i, (total, uid) in enumerate(result[:20], 1):
-        lines.append(f"{i}. <code>{uid}</code> — <b>{total:,.2f} ₽</b>")
-    bot.send_message(message.chat.id, "\n".join(lines) if len(lines) > 1 else "🏆 Пока рейтинг пуст.")
-
-
-# ВАЖНО: этот callback зарегистрирован ДО старого общего callback-хендлера.
-@bot.callback_query_handler(func=lambda call: call.data.startswith("ex_"))
-def handle_exchange_callback(call: CallbackQuery) -> None:
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id if call.message else user_id
-    try:
-        if call.data == "ex_refresh":
-            bot.answer_callback_query(call.id, "🔄 Обновляю рынок...")
-            _ex_replace_market(chat_id, user_id, 1)
-        elif call.data == "ex_portfolio":
-            bot.answer_callback_query(call.id)
-            handle_exchange_portfolio(call.message)
-        elif call.data == "ex_bonus":
-            bot.answer_callback_query(call.id)
-            handle_exchange_bonus(call.message)
-    except Exception as exc:
-        logger.exception("Exchange callback error: %s", exc)
-        try:
-            bot.answer_callback_query(call.id, "❌ Ошибка биржи", show_alert=True)
-        except Exception:
-            pass
-
-# ── END BERLIONS EXCHANGE SYSTEM ───────────────────────────────────────────────
-
-
-# ── Dice game logic ───────────────────────────────────────────────────────────
-
-@bot.message_handler(commands=["dice"])
-def handle_dice_command(message: Message) -> None:
-    user_id = message.from_user.id
-    now = time.time()
-    last_roll = _dice_cooldown.get(user_id, 0)
-    
-    # КД 60 секунд
-    if now - last_roll < 60:
-        bot.send_message(
-            message.chat.id,
-            f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!"
-        )
-        return
-    
-    if not _require_subscription(message.chat.id, user_id, "dice"):
-        return
-    
-    _play_dice(message.chat.id, user_id)
-
-def _play_dice(chat_id: int, user_id: int) -> None:
-    """Запускает бросок кубика и применяет cooldown."""
-    now = time.time()
-    last_roll = _dice_cooldown.get(user_id, 0)
-
-    # КД проверяется здесь, чтобы команда и кнопка использовали одну логику.
-    if now - last_roll < 60:
-        bot.send_message(
-            chat_id,
-            f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!"
-        )
-        return
-
-    # Ставим cooldown только непосредственно перед реальным броском.
-    _dice_cooldown[user_id] = now
-
-    try:
-        dice_msg = bot.send_dice(chat_id, emoji="🎲")
-        value = dice_msg.dice.value
-    except Exception:
-        # Если Telegram не принял бросок, не наказываем пользователя cooldown'ом.
-        _dice_cooldown.pop(user_id, None)
-        logger.exception("Не удалось отправить кубик в чат %s", chat_id)
-        bot.send_message(chat_id, "❌ Не удалось бросить кубик. Попробуй ещё раз.")
-        return
-
-    if value < 3:
-        result = (
-            f"😢 <b>Выпало {value}</b> — ты проиграл!\n\n"
-            f"Меньше 3 — не повезло. Попробуй ещё раз!"
-        )
-    elif value > 5:
-        result = (
-            f"🏆 <b>Выпало {value}</b> — ты победил!\n\n"
-            f"Максимум! Ты настоящий везунчик 🎉"
-        )
-    else:
-        result = (
-            f"😐 <b>Выпало {value}</b> — ничья!\n\n"
-            f"Не выиграл, но и не проиграл. Попробуй снова?"
-        )
-
-    markup = InlineKeyboardMarkup().add(
-        InlineKeyboardButton("🎲 Играть ещё", callback_data="play_dice")
-    )
-    bot.send_message(chat_id, result, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call: CallbackQuery) -> None:
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-
-    # Социальные кнопки должны обрабатываться раньше общего callback-хендлера.
-    # Этот хендлер зарегистрирован раньше функции брака, поэтому делегируем сюда.
-    if call.data and call.data.startswith("marry_"):
-        handle_social_marriage_callback(call)
-        return
-    logger.info("Клик от пользователя: %s (@%s), ID: %s", call.from_user.first_name, call.from_user.username, user_id)
-
-    if call.data.startswith("verify:"):
-        context = call.data[len("verify:"):]
-        if not _is_subscribed(user_id):
-            bot.answer_callback_query(call.id, "❌ Ты ещё не подписался на оба ресурса! Подпишись и попробуй снова.", show_alert=True)
-            return
-        bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
-        try: bot.delete_message(chat_id, call.message.message_id)
-        except Exception: pass
-        if context == "dice": _play_dice(chat_id, user_id)
-        elif context.startswith("key:"):
-            key = context[len("key:"):]
-            row = database.get_link(key)
-            if row: _deliver_link(chat_id, row)
-            else: bot.send_message(chat_id, "❌ Ссылка не найдена.")
-        return
-
-    if call.data.startswith("search_pick:"):
-        key = call.data[len("search_pick:"):]
-        bot.answer_callback_query(call.id)
-        try: bot.delete_message(chat_id, call.message.message_id)
-        except Exception as e: logger.warning("Failed to delete search message: %s", e)
-        row = database.get_link(key)
-        if row: _deliver_link(chat_id, row)
-        else: bot.send_message(chat_id, "❌ Контент не найден.")
-        return
-
-    if call.data == "play_dice":
-        bot.answer_callback_query(call.id)
-        
-        # Проверка КД для кнопки
-        now = time.time()
-        last_roll = _dice_cooldown.get(user_id, 0)
-        if now - last_roll < 60:
-            bot.send_message(
-                chat_id,
-                f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!"
-            )
-            return
-        
-        if not _require_subscription(chat_id, user_id, "dice"):
-            return
-        
-        _play_dice(chat_id, user_id)
-        return
-  
 # ── /stop — завершение сбора файлов для админов ───────────────────────────────
 
 @bot.message_handler(commands=["stop"])
@@ -1404,393 +629,407 @@ def handle_conversation(message: Message) -> None:
             except Exception as exc: bot.send_message(message.chat.id, f"❌ Ошибка: {exc}")
         else: bot.send_message(message.chat.id, "⚠️ Отправь файл, ссылку, <code>-</code> чтобы оставить текущее, или /stop чтобы сохранить уже добавленные файлы.")
 
-# ── Chat Admin System (Iris-like) - ПЛЕЙСХОЛДЕРЫ ───────────────────────────────
-# Эти функции требуют соответствующей реализации в database.py для работы с рангами.
 
-RANK_NAMES = {1: "Младший модератор", 2: "Модератор", 3: "Старший модератор", 4: "Администратор", 5: "Создатель"}
-
-# Функция _get_user_rank в текущем виде не взаимодействует с реальной БД для рангов.
-# Она использует `hasattr(database, "get_chat_admins")` как проверку, но `database.py`
-# не содержит этих функций. Это плейсхолдер.
-def _get_user_rank(chat_id: int, user_id: int) -> int:
-    """Возвращает ранг пользователя в чате. 0, если не админ."""
-    # ВНИМАНИЕ: Эта часть требует, чтобы 'database.py' имел функции для управления админами чата.
-    # Если их нет, эта функция всегда будет возвращать 0.
-    if hasattr(database, "get_chat_admins"):
-        try:
-            admins = database.get_chat_admins(chat_id)
-            for row in admins:
-                if isinstance(row, (list, tuple)):
-                    uid, rank = row[0], row[1]
-                else:
-                    uid, rank = row["user_id"], row["rank"]
-                if int(uid) == int(user_id):
-                    return int(rank)
-        except Exception as e:
-            logger.debug(f"Ошибка при получении ранга из БД: {e}")
-    return 0
-
-def _can_manage(chat_id: int, actor_id: int, target_id: int, required_rank: int) -> bool:
-    """Проверяет, может ли actor_id управлять target_id."""
-    if _is_admin(actor_id): return True # Глобальный админ может всё
-    if _is_admin(target_id): return False # Нельзя управлять глобальным админом
-    actor_rank = _get_user_rank(chat_id, actor_id)
-    target_rank = _get_user_rank(chat_id, target_id)
-    return actor_rank >= required_rank and actor_rank > target_rank
-
-def _parse_target(message: Message) -> int | None:
-    """Извлекает ID целевого пользователя из ответа или текста сообщения."""
-    if message.reply_to_message: return message.reply_to_message.from_user.id
-    parts = (message.text or "").split()
-    if len(parts) > 1 and parts[1].isdigit(): return int(parts[1])
-    return None
-
-@bot.message_handler(commands=["rank", "ranks"])
-def handle_rank(message: Message) -> None:
-    if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 3:
-        bot.send_message(message.chat.id, "⛔ Недостаточно прав.")
-        return
-    chat_id = message.chat.id
-    admins = [] # Здесь должен быть вызов database.get_chat_admins(chat_id)
-    if not hasattr(database, "get_chat_admins"):
-        bot.send_message(chat_id, "⚠️ Система рангов не настроена в database.py.")
-        return
-    
-    try:
-        admins = database.get_chat_admins(chat_id)
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ Ошибка получения админов: {e}")
+# ── Инструмент для получения Custom Emoji ID ──────────────────────────────────
+@bot.message_handler(commands=["emojiid", "эмодзиid"])
+def handle_emoji_id(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ Эта техническая команда доступна только администратору.")
         return
 
-    if not admins:
-        bot.send_message(chat_id, "📋 В этом чате нет назначенных админов.")
+    source = message.reply_to_message if message.reply_to_message else message
+    found = _extract_custom_emoji_ids(source)
+    if not found:
+        bot.send_message(
+            message.chat.id,
+            "🧩 <b>Custom Emoji ID не найден.</b>\n\n"
+            "Отправь нужный Premium-эмодзи отдельным сообщением, "
+            "ответь на него командой <code>/emojiid</code> и я покажу точный ID.",
+        )
         return
-    lines = ["<b>👮 Админы чата:</b>\n"]
-    for row in admins:
-        if isinstance(row, (list, tuple)):
-            uid, rank = row[0], row[1]
-        else:
-            uid, rank = row["user_id"], row["rank"]
-        lines.append(f"• User_{uid} — {RANK_NAMES.get(rank, f'Ранг {rank}')}")
-    bot.send_message(chat_id, "\n".join(lines))
 
-@bot.message_handler(commands=["setrank"])
-def handle_setrank(message: Message) -> None:
-    if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 4:
-        bot.send_message(message.chat.id, "⛔ Только от 4 ранга или глобальный админ.")
+    lines = ["🧩 <b>Custom Emoji ID</b>", ""]
+    for alt, cid in found:
+        lines.append(f"{alt} → <code>{html.escape(cid)}</code>")
+    bot.send_message(message.chat.id, "\n".join(lines))
+
+# ── /start (С новым приветствием) ─────────────────────────────────────────────
+
+@bot.message_handler(commands=["start"])
+def handle_start(message: Message) -> None:
+    _pending.pop(message.from_user.id, None)
+
+    username = message.from_user.username if message.from_user.username else "Без никнейма"
+    first_name = message.from_user.first_name
+    logger.info("Пользователь: %s (@%s), ID: %s", first_name, username, message.from_user.id)
+
+    text = message.text.strip()
+    parts = text.split(maxsplit=1)
+    key = parts[1].strip() if len(parts) > 1 else None
+
+    if not key:
+        welcome_text = (
+            "👋 <b>Привет! Я Berlions чат-бот.</b>\n\n"
+            "🎮 Здесь можно быстро найти игру, заказать отсутствующую игру "
+            "или получить случайную игру из базы.\n\n"
+            "Нажми на кнопку меню под полем ввода 👇"
+        )
+        _send_main_menu(
+            message.chat.id,
+            welcome_text,
+            private_only=(message.chat.type == "private"),
+        )
         return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ /setrank ID или ответь на сообщение"); return
-    parts = message.text.strip().split()
-    if len(parts) < 3 or not parts[2].isdigit(): bot.send_message(message.chat.id, "❓ /setrank <ID> <1-5>"); return
-    new_rank = int(parts[2])
-    if not 1 <= new_rank <= 5: bot.send_message(message.chat.id, "❌ Ранг от 1 до 5."); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 4): bot.send_message(message.chat.id, "⛔ Недостаточно прав."); return
-    # Здесь должен быть вызов database.set_admin_rank
-    if hasattr(database, "set_admin_rank"):
-        database.set_admin_rank(message.chat.id, target_id, new_rank)
-        bot.send_message(message.chat.id, f"✅ Пользователь {target_id} получил ранг {new_rank} — {RANK_NAMES.get(new_rank)}")
+
+    if not _require_subscription(message.chat.id, message.from_user.id, f"key:{key}"): return
+
+    row = database.get_link(key)
+    if row is None:
+        bot.send_message(message.chat.id, "❌ Ссылка не найдена или устарела.")
+        logger.warning("Unknown deep-link key: %r", key)
+        return
+
+    _deliver_link(message.chat.id, row)
+    logger.info("Served key %r to user %s", key, message.from_user.id)
+
+# ── /help ─────────────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["help", "помощь"])
+def handle_help(message: Message) -> None:
+    _send_main_menu(
+        message.chat.id,
+        "📚 <b>Меню Berlions</b>\n\n"
+        "📝 Заказать игру — оставить заявку на игру, которой пока нет в базе.\n"
+        "📋 Стол заказов — посмотреть, что чаще всего хотят пользователи.\n"
+        "🎲 Рандомная игра — случайная игра из базы, раз в 30 минут.\n"
+        "👤 Профиль — твой профиль, активность и награды.\n\n"
+        "Команды по-прежнему работают, но вводить их вручную необязательно.",
+        private_only=(message.chat.type == "private"),
+    )
+
+
+# ── Главная клавиатура / меню ────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "📝 Заказать игру"), content_types=["text"])
+def handle_menu_order(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "order"):
+        return
+    _order_pending[message.from_user.id] = message.chat.id
+    bot.send_message(
+        message.chat.id,
+        "📝 <b>Заказ игры</b>\n\n"
+        "Напиши название игры, которую хочешь увидеть в базе.\n"
+        "Можно написать не идеально — например <i>rdr2</i>, <i>Red Dead 2</i> или полное название.\n\n"
+        "Если такая заявка уже есть, новая копия не создастся — ты просто добавишь свой голос.\n\n"
+        "❌ Чтобы отменить, напиши <code>отмена</code>.",
+    )
+
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "📋 Стол заказов"), content_types=["text"])
+def handle_menu_orders(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "orders"):
+        return
+    _send_orders_list(message.chat.id, page=0)
+
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "🎲 Рандомная игра"), content_types=["text"])
+def handle_menu_random_game(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "random_game"):
+        return
+    _play_random_game(message)
+
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "👤 Профиль"), content_types=["text"])
+def handle_menu_profile(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "profile"):
+        return
+    handle_social_profile(message)
+
+
+@bot.message_handler(func=lambda m: bool(m.chat.type == "private" and m.text and m.text.strip() == "🔥 Самая разыскиваемая"), content_types=["text"])
+def handle_menu_most_wanted(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "most_wanted"):
+        return
+    _send_most_wanted(message.chat.id)
+
+
+@bot.message_handler(commands=["топигр", "mostwanted", "разыскиваемые"])
+def handle_most_wanted_command(message: Message) -> None:
+    if not _require_subscription(message.chat.id, message.from_user.id, "most_wanted_cmd"):
+        return
+    _send_most_wanted(message.chat.id)
+
+
+@bot.message_handler(func=lambda m: bool(
+    m.chat.type == "private" and m.text and m.from_user and
+    _order_pending.get(m.from_user.id) == m.chat.id and
+    m.text.strip().lower() == "отмена"
+), content_types=["text"])
+def handle_order_cancel(message: Message) -> None:
+    _order_pending.pop(message.from_user.id, None)
+    bot.send_message(message.chat.id, "❌ <b>Заказ отменён.</b>")
+
+
+@bot.message_handler(func=lambda m: bool(
+    m.chat.type == "private" and m.text and m.from_user and
+    _order_pending.get(m.from_user.id) == m.chat.id
+), content_types=["text"])
+def handle_order_text(message: Message) -> None:
+    user_id = message.from_user.id
+    chat_id = _order_pending.pop(user_id)
+    name = " ".join(message.text.strip().split())
+    if len(name) < 2:
+        bot.send_message(chat_id, "⚠️ Название слишком короткое. Напиши нормальное название игры.")
+        _order_pending[user_id] = chat_id
+        return
+    if len(name) > 100:
+        bot.send_message(chat_id, "⚠️ Название слишком длинное. До 100 символов, пожалуйста.")
+        _order_pending[user_id] = chat_id
+        return
+    key = _normalize_game_name(name)
+    conn = _orders_db()
+    now = datetime.now().isoformat(timespec="seconds")
+    row = conn.execute("SELECT * FROM game_requests WHERE name_key=?", (key,)).fetchone()
+    if row and row['status'] == 'open':
+        request_id = int(row['id'])
+        conn.execute("UPDATE game_requests SET updated_at=? WHERE id=?", (now, request_id))
+        created = False
+    elif row:
+        request_id = int(row['id'])
+        conn.execute("UPDATE game_requests SET name=?,updated_at=?,status='open' WHERE id=?", (name, now, request_id))
+        created = False
     else:
-        bot.send_message(message.chat.id, "⚠️ Функция set_admin_rank не найдена в database.py.")
-
-@bot.message_handler(commands=["demote"])
-def handle_demote(message: Message) -> None:
-    if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 4:
-        bot.send_message(message.chat.id, "⛔ Недостаточно прав.")
-        return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ Ответь на сообщение."); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 4): bot.send_message(message.chat.id, "⛔ Не можешь понизить."); return
-    # Здесь должен быть вызов database.remove_admin
-    if hasattr(database, "remove_admin"):
-        database.remove_admin(message.chat.id, target_id)
-        bot.send_message(message.chat.id, f"✅ Пользователь {target_id} разжалован.")
+        cur = conn.execute("INSERT INTO game_requests(name,name_key,first_user_id,created_at,updated_at,status) VALUES(?,?,?,?,?,'open')", (name,key,user_id,now,now))
+        request_id = int(cur.lastrowid)
+        created = True
+    conn.execute("INSERT INTO game_request_votes(request_id,user_id,vote,updated_at) VALUES(?,?,1,?) ON CONFLICT(request_id,user_id) DO UPDATE SET vote=1,updated_at=excluded.updated_at", (request_id,user_id,now))
+    conn.commit()
+    conn.close()
+    if created:
+        bot.send_message(chat_id, f"✅ <b>Заявка добавлена!</b>\n\n{_request_summary(request_id)}\n\nЕсли игра нужна — жми 👍, если нет — 👎.", reply_markup=_order_keyboard(request_id))
+        # Уведомляем всех админов, чтобы они видели спрос даже если не открывают стол.
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(admin_id, f"📥 <b>Новый заказ игры</b>\n\n{_request_summary(request_id)}\n\n👤 От: {_social_user_label(chat_id,user_id)}", reply_markup=_order_keyboard(request_id))
+            except Exception as exc:
+                logger.warning("Order admin notification failed for %s: %s", admin_id, exc)
     else:
-        bot.send_message(message.chat.id, "⚠️ Функция remove_admin не найдена в database.py.")
+        bot.send_message(chat_id, f"👍 <b>Твой голос добавлен к уже существующей заявке.</b>\n\n{_request_summary(request_id)}", reply_markup=_order_keyboard(request_id))
 
 
-@bot.message_handler(commands=["kick"])
-def handle_kick(message: Message) -> None:
-    if _get_user_rank(message.chat.id, message.from_user.id) < 2: bot.send_message(message.chat.id, "⛔ Требуется минимум 2 ранг."); return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ /kick (ответ)"); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 2): bot.send_message(message.chat.id, "⛔ Недостаточно прав."); return
+@bot.message_handler(commands=["dice", "кости"])
+def handle_dice_command(message: Message) -> None:
+    user_id = message.from_user.id
+    now = time.time()
+    last_roll = _dice_cooldown.get(user_id, 0)
+    if now - last_roll < 60:
+        bot.send_message(message.chat.id, f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!")
+        return
+    if not _require_subscription(message.chat.id, user_id, "dice"):
+        return
+    _dice_cooldown[user_id] = now
     try:
-        bot.ban_chat_member(message.chat.id, target_id)
-        bot.unban_chat_member(message.chat.id, target_id)
-        bot.send_message(message.chat.id, f"👢 Пользователь {target_id} кикнут.")
-    except Exception as e: bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=["warn"])
-def handle_warn(message: Message) -> None:
-    if _get_user_rank(message.chat.id, message.from_user.id) < 2: bot.send_message(message.chat.id, "⛔ Требуется минимум 2 ранг."); return
-    target_id = _parse_target(message)
-    if not target_id: bot.send_message(message.chat.id, "❓ /warn (ответ) [причина]"); return
-    if not _can_manage(message.chat.id, message.from_user.id, target_id, 2): bot.send_message(message.chat.id, "⛔ Недостаточно прав."); return
-    reason = " ".join(message.text.split()[2:]) if len(message.text.split()) > 2 else "Без причины"
-    # Здесь должен быть вызов database.add_warning
-    if hasattr(database, "add_warning"):
-        database.add_warning(message.chat.id, target_id, message.from_user.id, reason)
-        warnings = len(database.get_user_warnings(message.chat.id, target_id)) # Здесь должен быть вызов database.get_user_warnings
-        bot.send_message(message.chat.id, f"⚠️ Предупреждение {target_id} ({warnings}/3)\nПричина: {reason}")
-        if warnings >= 3:
-            try: bot.ban_chat_member(message.chat.id, target_id); bot.send_message(message.chat.id, "🚫 Автобан после 3 варнов.")
-            except: pass
-    else: bot.send_message(message.chat.id, "⚠️ Функции предупреждений не найдены в database.py.")
-
-
-
-# ── Chat moderation ────────────────────────────────────────────────────────────
-# Используем актуальные Bot API методы: ban_chat_member / restrict_chat_member.
-# Команды работают только в группах/супергруппах и требуют реального права
-# Telegram "can_restrict_members". Никаких массовых действий или удаления чата здесь нет.
-
-
-def _moderation_chat_ok(message: Message) -> bool:
-    if message.chat.type not in ("group", "supergroup"):
-        bot.send_message(message.chat.id, "⛔ Эта команда работает только в группе.")
-        return False
-    return True
-
-
-def _moderation_actor_can_restrict(message: Message) -> bool:
-    try:
-        member = bot.get_chat_member(message.chat.id, message.from_user.id)
-        if member.status == "creator":
-            return True
-        if member.status == "administrator" and getattr(member, "can_restrict_members", False):
-            return True
-    except ApiTelegramException as exc:
-        logger.warning("Cannot check moderator rights: %s", exc)
+        sent = bot.send_dice(message.chat.id, emoji="🎲")
+        value = getattr(sent.dice, "value", None)
+        if value is not None:
+            bot.send_message(message.chat.id, f"🎲 Выпало: <b>{value}</b>")
     except Exception:
-        logger.exception("Moderator permission check failed")
-    return False
+        logger.exception("Dice error")
+        bot.send_message(message.chat.id, "❌ Не удалось бросить кости. Попробуй ещё раз.")
 
 
-def _moderation_target(message: Message, arg_text: str = "") -> int | None:
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user.id
-    parts = (arg_text or "").split()
-    if not parts:
-        return None
-    token = parts[0].strip().rstrip(",.!?")
-    if token.isdigit():
-        return int(token)
-    if token.startswith("@"):
-        # Используем уже известного пользователя из социальной БД.
-        try:
-            conn = _social_db()
-            row = conn.execute(
-                "SELECT user_id FROM social_users WHERE chat_id=? AND username=? ORDER BY last_seen DESC LIMIT 1",
-                (message.chat.id, token[1:].lower()),
-            ).fetchone()
+def _edit_orders_list(chat_id: int, message_id: int, page: int = 0, page_size: int = 8) -> None:
+    conn = _orders_db()
+    total = int(conn.execute("SELECT COUNT(*) n FROM game_requests WHERE status='open'").fetchone()["n"])
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    rows = conn.execute("""
+        SELECT r.id,r.name,
+               COALESCE(SUM(CASE WHEN v.vote=1 THEN 1 ELSE 0 END),0) likes,
+               COALESCE(SUM(CASE WHEN v.vote=-1 THEN 1 ELSE 0 END),0) dislikes,
+               COUNT(v.user_id) voters
+        FROM game_requests r LEFT JOIN game_request_votes v ON v.request_id=r.id
+        WHERE r.status='open' GROUP BY r.id
+        ORDER BY (likes-dislikes) DESC,voters DESC,r.updated_at DESC LIMIT ? OFFSET ?
+    """, (page_size,page*page_size)).fetchall()
+    conn.close()
+    if not rows:
+        bot.edit_message_text("📋 <b>Стол заказов пуст.</b>", chat_id, message_id)
+        return
+    lines=[f"📋 <b>СТОЛ ЗАКАЗОВ</b> · {total} заявок","","Самые востребованные игры сверху 👇",""]
+    for i,r in enumerate(rows,page*page_size+1):
+        lines.append(f"<b>{i}. 🎮 {html.escape(r['name'])}</b>\n   👥 {int(r['voters'])} · 👍 {int(r['likes'])} · 👎 {int(r['dislikes'])}")
+    markup=InlineKeyboardMarkup(row_width=1)
+    for r in rows: markup.add(InlineKeyboardButton(f"🎮 {str(r['name'])[:45]}",callback_data=f"order_open:{int(r['id'])}"))
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("⬅️",callback_data=f"orders_page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="orders_noop"))
+    if page<pages-1: nav.append(InlineKeyboardButton("➡️",callback_data=f"orders_page:{page+1}"))
+    markup.row(*nav)
+    bot.edit_message_text("\n".join(lines),chat_id,message_id,reply_markup=markup)
+
+
+def _send_orders_list(chat_id: int, page: int = 0, page_size: int = 8) -> None:
+    conn = _orders_db()
+    total = int(conn.execute("SELECT COUNT(*) n FROM game_requests WHERE status='open'").fetchone()["n"])
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    rows = conn.execute("""
+        SELECT r.id,r.name,r.status,
+               COALESCE(SUM(CASE WHEN v.vote=1 THEN 1 ELSE 0 END),0) likes,
+               COALESCE(SUM(CASE WHEN v.vote=-1 THEN 1 ELSE 0 END),0) dislikes,
+               COUNT(v.user_id) voters
+        FROM game_requests r LEFT JOIN game_request_votes v ON v.request_id=r.id
+        WHERE r.status='open'
+        GROUP BY r.id
+        ORDER BY (likes - dislikes) DESC, voters DESC, r.updated_at DESC
+        LIMIT ? OFFSET ?
+    """, (page_size, page * page_size)).fetchall()
+    conn.close()
+    if not rows:
+        bot.send_message(chat_id, "📋 <b>Стол заказов пуст.</b>\n\nПока никто ничего не заказал.")
+        return
+    lines = [f"📋 <b>СТОЛ ЗАКАЗОВ</b> · {total} заявок", "", "Самые востребованные игры сверху 👇", ""]
+    for i, r in enumerate(rows, page * page_size + 1):
+        lines.append(f"<b>{i}. 🎮 {html.escape(r['name'])}</b>\n   👥 {int(r['voters'])} · 👍 {int(r['likes'])} · 👎 {int(r['dislikes'])}")
+    markup = InlineKeyboardMarkup(row_width=1)
+    for r in rows:
+        markup.add(InlineKeyboardButton(f"🎮 {str(r['name'])[:45]}", callback_data=f"order_open:{int(r['id'])}"))
+    nav=[]
+    if page > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"orders_page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="orders_noop"))
+    if page < pages - 1: nav.append(InlineKeyboardButton("➡️", callback_data=f"orders_page:{page+1}"))
+    markup.row(*nav)
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
+
+
+def _play_random_game(message: Message) -> None:
+    user_id = message.from_user.id
+    now = time.time()
+    conn = _orders_db()
+    row = conn.execute("SELECT last_used FROM random_game_cooldowns WHERE user_id=?", (user_id,)).fetchone()
+    if row:
+        remaining = RANDOM_GAME_COOLDOWN - (now - float(row['last_used']))
+        if remaining > 0:
+            mins = int(remaining // 60)
+            secs = int(remaining % 60)
             conn.close()
-            return int(row["user_id"]) if row else None
-        except Exception:
-            logger.exception("Moderation username lookup failed")
-    return None
-
-
-def _moderation_target_is_protected(chat_id: int, target_id: int) -> tuple[bool, str]:
+            bot.send_message(message.chat.id, f"⏳ <b>Рандом уже использован.</b>\nПопробуй снова через <b>{mins} мин. {secs:02d} сек.</b>")
+            return
+    # Получаем список существующих игр из основной БД. Это сохраняет совместимость со старой базой.
+    rows = database.list_links()
+    if not rows:
+        conn.close()
+        bot.send_message(message.chat.id, "📭 В базе пока нет игр для рандома.")
+        return
+    chosen = random.choice(rows)
+    conn.execute("INSERT INTO random_game_cooldowns(user_id,last_used) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_used=excluded.last_used", (user_id, now))
+    conn.commit()
+    conn.close()
+    bot.send_message(message.chat.id, f"🎲 <b>Тебе выпала случайная игра!</b>\n\n🎮 <b>{html.escape(str(chosen['content_text']))}</b>")
     try:
-        me = bot.get_me()
-        if target_id == me.id:
-            return True, "❌ Я не буду применять модерацию к самому себе."
-        member = bot.get_chat_member(chat_id, target_id)
-        if member.status == "creator":
-            return True, "⛔ Нельзя модерировать владельца группы."
-        if member.status == "administrator":
-            return True, "⛔ Нельзя модерировать администратора группы."
-        return False, ""
-    except ApiTelegramException as exc:
-        desc = (exc.description or "").lower()
-        if "user not found" in desc or "participant not found" in desc:
-            return True, "❌ Пользователь не найден в этой группе."
-        logger.warning("Target protection check failed: %s", exc)
-        return True, "❌ Не удалось безопасно проверить пользователя. Действие отменено."
+        _deliver_link(message.chat.id, chosen)
     except Exception:
-        logger.exception("Target protection check failed")
-        return True, "❌ Не удалось безопасно проверить пользователя. Действие отменено."
+        logger.exception("Random game delivery failed")
+        bot.send_message(message.chat.id, "⚠️ Игра выбрана, но файл не удалось отправить. Администратору стоит проверить эту запись.")
 
 
-def _parse_mute_duration(token: str) -> int | None:
-    match = re.fullmatch(r"(\d{1,4})(s|m|h|d)", token.lower())
-    if not match:
-        return None
-    amount = int(match.group(1))
-    unit = match.group(2)
-    seconds = amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-    if seconds < 10 or seconds > 30 * 86400:
-        return None
-    return seconds
+# ── /search (С анимацией и умным поиском) ─────────────────────────────────────
 
-
-@bot.message_handler(commands=["ban", "бан"])
-def handle_ban(message: Message) -> None:
-    if not _moderation_chat_ok(message):
-        return
-    if not _moderation_actor_can_restrict(message):
-        bot.send_message(message.chat.id, "⛔ У тебя нет права блокировать участников.")
-        return
-    arg_text = " ".join((message.text or "").split()[1:])
-    target_id = _moderation_target(message, arg_text)
-    if not target_id:
-        bot.send_message(message.chat.id, "❓ Ответь на сообщение пользователя или укажи его ID: <code>/бан 123456789</code>")
-        return
-    protected, error = _moderation_target_is_protected(message.chat.id, target_id)
-    if protected:
-        bot.send_message(message.chat.id, error)
-        return
-    reason = "Без причины"
-    if message.reply_to_message:
-        parts = (message.text or "").split(maxsplit=1)
-        reason = parts[1].strip() if len(parts) > 1 else reason
-    else:
-        parts = (message.text or "").split(maxsplit=2)
-        reason = parts[2].strip() if len(parts) > 2 else reason
-    try:
-        bot.ban_chat_member(message.chat.id, target_id)
-        bot.send_message(message.chat.id, f"🚫 Пользователь <code>{target_id}</code> заблокирован.\nПричина: {html.escape(reason)}")
-        logger.info("User %s banned in chat %s by %s: %s", target_id, message.chat.id, message.from_user.id, reason)
-    except ApiTelegramException as exc:
-        logger.warning("Ban failed: %s", exc)
-        bot.send_message(message.chat.id, f"❌ Telegram не разрешил бан: <code>{html.escape(exc.description or str(exc))}</code>")
-    except Exception as exc:
-        logger.exception("Ban error")
-        bot.send_message(message.chat.id, f"❌ Ошибка бана: <code>{html.escape(str(exc))}</code>")
-
-
-@bot.message_handler(commands=["mute", "мут"])
-def handle_mute(message: Message) -> None:
-    if not _moderation_chat_ok(message):
-        return
-    if not _moderation_actor_can_restrict(message):
-        bot.send_message(message.chat.id, "⛔ У тебя нет права ограничивать участников.")
-        return
-    raw_parts = (message.text or "").split()
-    target_id = _moderation_target(message, " ".join(raw_parts[1:]))
-    if not target_id:
-        bot.send_message(message.chat.id, "❓ Ответь на сообщение или укажи ID.\nПример: <code>/мут 30м спам</code>")
-        return
-    protected, error = _moderation_target_is_protected(message.chat.id, target_id)
-    if protected:
-        bot.send_message(message.chat.id, error)
-        return
-    duration_token = None
-    reason = "Без причины"
-    if message.reply_to_message:
-        if len(raw_parts) >= 2:
-            duration_token = raw_parts[1]
-            reason = " ".join(raw_parts[2:]) or reason
-    else:
-        if len(raw_parts) >= 3:
-            duration_token = raw_parts[2]
-            reason = " ".join(raw_parts[3:]) or reason
-    seconds = _parse_mute_duration(duration_token or "")
-    if seconds is None:
-        bot.send_message(message.chat.id, "❓ Укажи срок: <code>/мут 30м причина</code> или ответь на сообщение и напиши <code>/мут 1ч причина</code>.\nДопустимо: s, m, h, d; от 10 секунд до 30 дней.")
-        return
-    until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=False,
-            can_send_audios=False,
-            can_send_documents=False,
-            can_send_photos=False,
-            can_send_videos=False,
-            can_send_video_notes=False,
-            can_send_voice_notes=False,
-            can_send_polls=False,
-            can_add_web_page_previews=False,
-            can_change_info=False,
-            can_invite_users=True,
-            can_pin_messages=False,
-            can_manage_topics=False,
+@bot.message_handler(commands=["search", "поиск"])
+def handle_search(message: Message) -> None:
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.send_message(
+            message.chat.id,
+            "🔍 <b>Поиск по играм</b>\n\n"
+            "Использование: <code>/search название игры</code>\n\n"
+            "Пример: <code>/search minecraft</code>",
         )
-        bot.restrict_chat_member(message.chat.id, target_id, permissions=permissions, until_date=until)
-        bot.send_message(message.chat.id, f"🔇 Пользователь <code>{target_id}</code> получил мут на <b>{html.escape(duration_token or '')}</b>.\nПричина: {html.escape(reason)}")
-        logger.info("User %s muted in chat %s by %s for %ss: %s", target_id, message.chat.id, message.from_user.id, seconds, reason)
-    except TypeError:
-        # Совместимость со старыми версиями pyTelegramBotAPI: используем только базовые права.
-        try:
-            permissions = ChatPermissions(can_send_messages=False)
-            bot.restrict_chat_member(message.chat.id, target_id, permissions=permissions, until_date=until)
-            bot.send_message(message.chat.id, f"🔇 Пользователь <code>{target_id}</code> получил мут на <b>{html.escape(duration_token or '')}</b>.\nПричина: {html.escape(reason)}")
-        except Exception as exc:
-            logger.exception("Mute compatibility fallback failed")
-            bot.send_message(message.chat.id, f"❌ Не удалось выдать мут: <code>{html.escape(str(exc))}</code>")
-    except ApiTelegramException as exc:
-        logger.warning("Mute failed: %s", exc)
-        bot.send_message(message.chat.id, f"❌ Telegram не разрешил мут: <code>{html.escape(exc.description or str(exc))}</code>")
-    except Exception as exc:
-        logger.exception("Mute error")
-        bot.send_message(message.chat.id, f"❌ Ошибка мута: <code>{html.escape(str(exc))}</code>")
-
-
-@bot.message_handler(commands=["unban", "разбан"])
-def handle_unban(message: Message) -> None:
-    if not _moderation_chat_ok(message) or not _moderation_actor_can_restrict(message):
-        if message.chat.type in ("group", "supergroup"):
-            bot.send_message(message.chat.id, "⛔ У тебя нет права снимать бан.")
         return
-    target_id = _moderation_target(message, " ".join((message.text or "").split()[1:]))
-    if not target_id:
-        bot.send_message(message.chat.id, "❓ Ответь на сообщение или укажи ID пользователя.")
-        return
-    try:
-        bot.unban_chat_member(message.chat.id, target_id, only_if_banned=True)
-        bot.send_message(message.chat.id, f"✅ Бан с пользователя <code>{target_id}</code> снят.")
-    except Exception as exc:
-        logger.exception("Unban error")
-        bot.send_message(message.chat.id, f"❌ Не удалось снять бан: <code>{html.escape(str(exc))}</code>")
 
+    query = parts[1].strip()
+    query_lower = query.lower()
+    
+    # === ХАКЕРСКАЯ АНИМАЦИЯ ИНИЦИАЛИЗАЦИИ ===
+    loader_msg = bot.send_message(
+        message.chat.id,
+        f"<code>> CONNECTING TO BERLIONS_DB...</code>\n"
+        f"<code>[██████░░░░░░░░] 45%</code>\n"
+        f"<i>Ага, ищу таккк, таккк...</i>"
+    )
+    
+    time.sleep(1.0)  # Небольшая пауза для эффекта загрузки
 
-@bot.message_handler(commands=["unmute", "размут"])
-def handle_unmute(message: Message) -> None:
-    if not _moderation_chat_ok(message) or not _moderation_actor_can_restrict(message):
-        if message.chat.type in ("group", "supergroup"):
-            bot.send_message(message.chat.id, "⛔ У тебя нет права снимать мут.")
-        return
-    target_id = _moderation_target(message, " ".join((message.text or "").split()[1:]))
-    if not target_id:
-        bot.send_message(message.chat.id, "❓ Ответь на сообщение или укажи ID пользователя.")
-        return
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_add_web_page_previews=True,
-            can_change_info=False,
-            can_invite_users=True,
-            can_pin_messages=False,
-            can_manage_topics=False,
+    rows = database.search_links(query) # Получаем все потенциальные результаты
+    
+    # === УМНЫЙ ПОИСК (ФИЛЬТРАЦИЯ) ===
+    filtered_rows = []
+    if len(query) <= 2:
+        # Для коротких запросов ищем только те, что НАЧИНАЮТСЯ с этой буквы/символа
+        filtered_rows = [r for r in rows if r["content_text"].lower().startswith(query_lower)]
+    else:
+        # Для длинных: сначала те, что начинаются на этот текст, потом все остальные совпадения
+        starts = [r for r in rows if r["content_text"].lower().startswith(query_lower)]
+        contains = [r for r in rows if query_lower in r["content_text"].lower() and not r["content_text"].lower().startswith(query_lower)]
+        filtered_rows = starts + contains # Объединяем, сначала "начинающиеся", потом "содержащие"
+
+    if not filtered_rows:
+        bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=loader_msg.message_id,
+            text=f"<code>> SEARCH FAILED</code>\n\n"
+                 f"😔 По запросу <b>«{html.escape(query)}»</b> ничего не найдено.\n\n"
+                 f"Попробуй другое название."
         )
-        bot.restrict_chat_member(message.chat.id, target_id, permissions=permissions)
-        bot.send_message(message.chat.id, f"🔊 Пользователь <code>{target_id}</code> снова может писать.")
-    except TypeError:
-        try:
-            bot.restrict_chat_member(message.chat.id, target_id, permissions=ChatPermissions(can_send_messages=True))
-            bot.send_message(message.chat.id, f"🔊 Пользователь <code>{target_id}</code> снова может писать.")
-        except Exception as exc:
-            logger.exception("Unmute fallback failed")
-            bot.send_message(message.chat.id, f"❌ Не удалось снять мут: <code>{html.escape(str(exc))}</code>")
-    except Exception as exc:
-        logger.exception("Unmute error")
-        bot.send_message(message.chat.id, f"❌ Не удалось снять мут: <code>{html.escape(str(exc))}</code>")
+        return
 
+    markup = InlineKeyboardMarkup(row_width=1)
+    is_private = message.chat.type == "private"
+
+    for row in filtered_rows[:15]:  # максимум 15 результатов
+        title = row["content_text"]
+        btn_label = title if len(title) <= 60 else title[:57] + "…"
+        
+        if is_private:
+            markup.add(
+                InlineKeyboardButton(
+                    f"🎮 {btn_label}",
+                    callback_data=f"search_pick:{row['key']}",
+                )
+            )
+        else:
+            markup.add(
+                InlineKeyboardButton(
+                    f"🎮 {btn_label}",
+                    url=_deep_link(row["key"]),
+                )
+            )
+
+    # Засчитываем только те игры, которые реально показали пользователю.
+    # Повторные поиски одним и тем же пользователем рейтинг не накручивают.
+    _record_game_searches(message.from_user.id, filtered_rows[:15])
+
+    count = len(filtered_rows)
+    
+    # === НАШЁЛ И ВЫДАЧА ===
+    bot.edit_message_text(
+        chat_id=message.chat.id,
+        message_id=loader_msg.message_id,
+        text=f"<code>> DATABASE UNLOCKED</code>\n"
+             f"<code>[██████████████] 100%</code>\n\n"
+             f"🔑 <b>НАШЁЛ!</b>\n\n"
+             f"🔍 Результатов по запросу «{html.escape(query)}»: <b>{count}</b>\n"
+             f"Выбери что тебя интересует 👇",
+        reply_markup=markup
+    )
 
 
 # ── BERLIONS SOCIAL SYSTEM ────────────────────────────────────────────────────
 # Профили, активность, награды, браки, кланы и безопасные ролевые команды.
 
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 SOCIAL_DB = "social.db"
 SOCIAL_GRAPH_DIR = "social_graphs"
@@ -1874,6 +1113,14 @@ def _social_init_db():
         joined_at TEXT NOT NULL,
         PRIMARY KEY(chat_id, user_id)
     );
+
+    CREATE TABLE IF NOT EXISTS social_clan_bans (
+        chat_id INTEGER NOT NULL,
+        clan_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        banned_at TEXT NOT NULL,
+        PRIMARY KEY(chat_id, clan_id, user_id)
+    );
     """)
     conn.commit()
     conn.close()
@@ -1886,6 +1133,41 @@ def _social_now():
     return datetime.now().replace(microsecond=0)
 
 
+def _mention_user(chat_id: int | None, user_id: int, name: str | None = None) -> str:
+    """Единый кликабельный Telegram-mention для любого места бота."""
+    display = name or "Пользователь"
+
+    # Сначала берём сохранённые данные соцсистемы — это работает даже там,
+    # где get_chat_member недоступен.
+    if chat_id is not None:
+        try:
+            conn = _social_db()
+            row = conn.execute(
+                "SELECT username,first_name,last_name FROM social_users WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            ).fetchone()
+            conn.close()
+            if row:
+                if row["username"]:
+                    display = "@" + row["username"]
+                else:
+                    display = " ".join(x for x in (row["first_name"], row["last_name"]) if x).strip() or display
+        except Exception:
+            pass
+
+        try:
+            member = bot.get_chat_member(chat_id, user_id)
+            user = member.user
+            if user.username:
+                display = "@" + user.username
+            else:
+                display = " ".join(x for x in (user.first_name, user.last_name) if x).strip() or display
+        except Exception:
+            pass
+
+    return f'<a href="tg://user?id={user_id}">{html.escape(str(display))}</a>'
+
+
 def _social_user_label(chat_id: int, user_id: int) -> str:
     conn = _social_db()
     row = conn.execute(
@@ -1895,11 +1177,11 @@ def _social_user_label(chat_id: int, user_id: int) -> str:
     conn.close()
     if row:
         if row["username"]:
-            return "@" + html.escape(row["username"])
+            return _mention_user(chat_id, user_id, "@" + row["username"])
         name = " ".join(x for x in (row["first_name"], row["last_name"]) if x).strip()
         if name:
-            return html.escape(name)
-    return f"<code>{user_id}</code>"
+            return _mention_user(chat_id, user_id, name)
+    return _mention_user(chat_id, user_id)
 
 
 def _social_register(message: Message) -> None:
@@ -1961,52 +1243,85 @@ def _social_name_from_message(message: Message) -> str:
 
 
 def _social_period_start(period: str):
+    """Возвращает начало периода по локальному времени бота."""
     now = _social_now()
+    base = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
     if period == "day":
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return base
     if period == "week":
-        base = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Неделя: с понедельника 00:00 до текущего момента.
         return base - timedelta(days=base.weekday())
     if period == "month":
-        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return datetime.min
+        # Месяц: с первого числа текущего месяца 00:00 до текущего момента.
+        return base.replace(day=1)
+    return None
 
 
 def _social_activity_for_user(chat_id: int, user_id: int, period: str = "all") -> int:
     conn = _social_db()
     if period == "all":
-        row = conn.execute("SELECT COALESCE(SUM(messages),0) n FROM social_activity WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(messages),0) n "
+            "FROM social_activity WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        ).fetchone()
     else:
         start = _social_period_start(period).date().isoformat()
-        row = conn.execute("SELECT COALESCE(SUM(messages),0) n FROM social_activity WHERE chat_id=? AND user_id=? AND day>=?", (chat_id, user_id, start)).fetchone()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(messages),0) n "
+            "FROM social_activity "
+            "WHERE chat_id=? AND user_id=? AND day>=?",
+            (chat_id, user_id, start),
+        ).fetchone()
     conn.close()
     return int(row["n"] or 0)
 
 
 def _social_top_rows(chat_id: int, period: str, limit: int = 10):
+    """Топ сообщений: всё время, текущий день, текущая неделя или текущий месяц."""
     conn = _social_db()
+
     if period == "all":
+        # ВАЖНО: здесь нет ограничения по дате — учитывается вся история.
         rows = conn.execute("""
-            SELECT u.user_id,u.username,u.first_name,u.last_name,COALESCE(SUM(a.messages),0) messages
-            FROM social_users u LEFT JOIN social_activity a
-              ON a.chat_id=u.chat_id AND a.user_id=u.user_id
+            SELECT
+                u.user_id,
+                u.username,
+                u.first_name,
+                u.last_name,
+                COALESCE(SUM(a.messages),0) AS messages
+            FROM social_users u
+            LEFT JOIN social_activity a
+              ON a.chat_id=u.chat_id
+             AND a.user_id=u.user_id
             WHERE u.chat_id=?
             GROUP BY u.user_id
+            HAVING messages > 0
             ORDER BY messages DESC, u.last_seen ASC
             LIMIT ?
         """, (chat_id, limit)).fetchall()
     else:
         start = _social_period_start(period).date().isoformat()
         rows = conn.execute("""
-            SELECT u.user_id,u.username,u.first_name,u.last_name,COALESCE(SUM(a.messages),0) messages
-            FROM social_users u LEFT JOIN social_activity a
-              ON a.chat_id=u.chat_id AND a.user_id=u.user_id AND a.day>=?
+            SELECT
+                u.user_id,
+                u.username,
+                u.first_name,
+                u.last_name,
+                COALESCE(SUM(a.messages),0) AS messages
+            FROM social_users u
+            LEFT JOIN social_activity a
+              ON a.chat_id=u.chat_id
+             AND a.user_id=u.user_id
+             AND a.day>=?
             WHERE u.chat_id=?
             GROUP BY u.user_id
             HAVING messages > 0
             ORDER BY messages DESC, u.last_seen ASC
             LIMIT ?
         """, (start, chat_id, limit)).fetchall()
+
     conn.close()
     return rows
 
@@ -2125,23 +1440,81 @@ def _social_active_marriage(conn, chat_id: int, user_id: int):
 def handle_social_profile(message: Message) -> None:
     args = " ".join((message.text or "").split()[1:])
     target = _social_target(message, args) or message.from_user.id
+    # Регистрируем автора запроса сразу, чтобы первое появление сохранялось.
+    try: _social_register(message)
+    except Exception: pass
     conn = _social_db()
-    row = conn.execute("SELECT first_name,username FROM social_users WHERE chat_id=? AND user_id=?", (message.chat.id,target)).fetchone()
+    row = conn.execute("SELECT * FROM social_users WHERE chat_id=? AND user_id=?", (message.chat.id,target)).fetchone()
+    if not row:
+        try:
+            member=bot.get_chat_member(message.chat.id,target); u=member.user
+            now=_social_now().isoformat(sep=" ")
+            conn.execute("INSERT OR IGNORE INTO social_users(chat_id,user_id,username,first_name,last_name,first_seen,last_seen) VALUES(?,?,?,?,?,?,?)",
+                         (message.chat.id,target,u.username,u.first_name or "",u.last_name or "",now,now)); conn.commit()
+            row=conn.execute("SELECT * FROM social_users WHERE chat_id=? AND user_id=?",(message.chat.id,target)).fetchone()
+        except Exception: pass
+    day=_social_activity_for_user(message.chat.id,target,"day")
+    week=_social_activity_for_user(message.chat.id,target,"week")
+    month=_social_activity_for_user(message.chat.id,target,"month")
+    label=_social_user_label(message.chat.id,target)
+    display=("@"+row["username"]) if row and row["username"] else ((row["first_name"] if row else None) or "Пользователь")
+
+    conn=_social_db()
+    awards=conn.execute("SELECT reason,created_at,from_user FROM social_awards WHERE chat_id=? AND to_user=? ORDER BY id DESC LIMIT 10",(message.chat.id,target)).fetchall()
+    marriage=conn.execute("""SELECT * FROM social_marriages WHERE chat_id=? AND active=1 AND (user1=? OR user2=?) LIMIT 1""",(message.chat.id,target,target)).fetchone()
+    clan=conn.execute("""SELECT c.id,c.name,c.owner_id,m.joined_at FROM social_clan_members m JOIN social_clans c ON c.id=m.clan_id WHERE m.chat_id=? AND m.user_id=? LIMIT 1""",(message.chat.id,target)).fetchone()
     conn.close()
-    day = _social_activity_for_user(message.chat.id,target,"day")
-    week = _social_activity_for_user(message.chat.id,target,"week")
-    month = _social_activity_for_user(message.chat.id,target,"month")
-    total = _social_activity_for_user(message.chat.id,target,"all")
-    name = row["username"] if row and row["username"] else (row["first_name"] if row else f"User {target}")
-    display_name = ("@" + name) if row and row["username"] else name
-    path=os.path.join(SOCIAL_GRAPH_DIR,f"profile_{message.chat.id}_{target}.png")
-    _social_profile_png(path,display_name,day,week,month,total)
-    caption=(f"👤 <b>Профиль {html.escape(str(display_name))}</b>\n\n"
-             f"💬 Сегодня: <b>{day}</b> сообщений\n"
-             f"📅 За неделю: <b>{week}</b>\n"
-             f"🗓 За месяц: <b>{month}</b>\n"
-             f"📊 Всего: <b>{total}</b>")
-    with open(path,"rb") as photo: bot.send_photo(message.chat.id,photo,caption=caption)
+
+    def duration_from(start):
+        try:
+            d=max(0,(_social_now()-datetime.fromisoformat(start)).days)
+            if d < 30: return f"{d} дн."
+            months=d//30; days=d%30
+            return f"{months} мес." + (f" {days} дн." if days else "")
+        except Exception: return "неизвестно"
+
+    first_seen=duration_from(row["first_seen"]) if row else "неизвестно"
+    spouse=None; marriage_duration=None
+    if marriage:
+        spouse_id=int(marriage["user2"] if int(marriage["user1"])==target else marriage["user1"])
+        spouse=_social_user_label(message.chat.id,spouse_id)
+        marriage_duration=_social_duration_text(marriage["created_at"])
+
+    lines=[f"👤 <b>Это пользователь {label}</b>","",
+           "💚 <b>Состоит в чате</b>",
+           f"📅 В чате: <b>{first_seen}</b>",
+           "",
+           f"💬 <b>Активность:</b> {day} дн. / {week} нед. / {month} мес."]
+    if clan:
+        owner_mark=" 👑" if int(clan["owner_id"])==target else ""
+        lines += [f"🏰 Клан: <b>{html.escape(clan['name'])}</b>{owner_mark}"]
+    else:
+        lines += ["🏰 Клан: <b>нет</b>"]
+    if spouse:
+        lines += [f"💍 Брак: {spouse} · <b>{marriage_duration}</b>"]
+    else:
+        lines += ["💍 Брак: <b>нет</b>"]
+    lines.append("")
+    lines.append("🏆 <b>НАГРАДЫ</b>")
+    if awards:
+        for a in awards:
+            lines.append(f"🎗 {html.escape(a['reason'])} · <b>{duration_from(a['created_at'])}</b>")
+    else:
+        lines.append("— пока нет")
+    caption="\n".join(lines)
+
+    # Настоящая аватарка Telegram вместо нарисованной карточки.
+    try:
+        photos=bot.get_user_profile_photos(target,limit=1)
+        if photos and photos.total_count and photos.photos and photos.photos[0]:
+            file_id=photos.photos[0][-1].file_id
+            file_info=bot.get_file(file_id)
+            data=bot.download_file(file_info.file_path)
+            bot.send_photo(message.chat.id, io.BytesIO(data), caption=caption)
+            return
+    except Exception:
+        logger.exception("Profile avatar load error")
+    bot.send_message(message.chat.id,caption)
 
 
 @bot.message_handler(commands=["awards", "награды"])
@@ -2185,78 +1558,122 @@ def handle_social_marriages(message: Message) -> None:
 @bot.message_handler(commands=["clans", "кланы"])
 def handle_social_clans(message: Message) -> None:
     conn=_social_db()
-    rows=conn.execute("""
-        SELECT c.name,c.owner_id,COUNT(m.user_id) members
-        FROM social_clans c LEFT JOIN social_clan_members m ON m.clan_id=c.id
-        WHERE c.chat_id=? GROUP BY c.id ORDER BY members DESC,c.name LIMIT 20
-    """,(message.chat.id,)).fetchall()
-    conn.close()
+    rows=conn.execute("""SELECT c.id,c.name,c.owner_id,COUNT(m.user_id) members FROM social_clans c LEFT JOIN social_clan_members m ON m.clan_id=c.id WHERE c.chat_id=? GROUP BY c.id ORDER BY members DESC,c.name LIMIT 20""",(message.chat.id,)).fetchall()
     if not rows:
-        bot.send_message(message.chat.id,"🏰 Кланов пока нет. Создай первый: <code>создать клан название</code>")
-        return
+        conn.close(); bot.send_message(message.chat.id,"🏰 Кланов пока нет. Создай первый: <code>создать клан название</code>"); return
     lines=["🏰 <b>Кланы Berlions</b>\n"]
-    for i,r in enumerate(rows,1): lines.append(f"{i}. <b>{html.escape(r['name'])}</b> — 👥 {r['members']}")
-    bot.send_message(message.chat.id,"\n".join(lines))
+    for i,r in enumerate(rows,1):
+        members=conn.execute("SELECT user_id FROM social_clan_members WHERE chat_id=? AND clan_id=? ORDER BY joined_at",(message.chat.id,r["id"])).fetchall()
+        names=[_social_user_label(message.chat.id,int(m["user_id"])) for m in members]
+        member_text=", ".join(names) if names else "нет участников"
+        lines.append(f"{i}. <b>{html.escape(r['name'])}</b> — 👥 {r['members']}\n   👑 Владелец: {_social_user_label(message.chat.id,int(r['owner_id']))}\n   👤 {member_text}")
+    conn.close()
+    bot.send_message(message.chat.id,"\n\n".join(lines))
 
 
 @bot.message_handler(commands=["top"])
 def handle_social_top_command(message: Message) -> None:
     handle_social_top(message,"all")
-    # Старый рейтинг биржи не теряем: он доступен отдельно через /topmoney.
+
 
 
 def handle_social_top(message: Message, period: str = "all") -> None:
-    rows=_social_top_rows(message.chat.id,period,10)
-    title={"all":"🏆 ТОП АКТИВНОСТИ","day":"🔥 ТОП ДНЯ","week":"📅 ТОП НЕДЕЛИ","month":"🗓 ТОП МЕСЯЦА"}[period]
+    rows = _social_top_rows(message.chat.id, period, 10)
+    title = {
+        "all": "🏆 ТОП ЗА ВСЁ ВРЕМЯ",
+        "day": "🔥 ТОП ДНЯ",
+        "week": "📅 ТОП НЕДЕЛИ",
+        "month": "🗓 ТОП МЕСЯЦА",
+    }[period]
+
     if not rows:
-        bot.send_message(message.chat.id,"📊 Пока нет статистики активности.")
+        bot.send_message(message.chat.id, "📊 За этот период сообщений пока нет.")
         return
-    lines=[f"<b>{title}</b>\n"]
-    medals=["🥇","🥈","🥉"]
-    for i,r in enumerate(rows,1):
-        label=("@"+r['username']) if r['username'] else (r['first_name'] or f"User {r['user_id']}")
-        prefix=medals[i-1] if i<=3 else f"{i}."
-        lines.append(f"{prefix} <b>{html.escape(str(label))}</b> — <b>{r['messages']}</b> сообщ.")
-    bot.send_message(message.chat.id,"\n".join(lines))
+
+    conn = _social_db()
+    if period == "all":
+        # Полная история — без фильтра по дате.
+        total_chat = conn.execute(
+            "SELECT COALESCE(SUM(messages),0) n "
+            "FROM social_activity WHERE chat_id=?",
+            (message.chat.id,),
+        ).fetchone()["n"]
+        period_text = "За всю историю чата"
+    else:
+        start = _social_period_start(period).date().isoformat()
+        total_chat = conn.execute(
+            "SELECT COALESCE(SUM(messages),0) n "
+            "FROM social_activity WHERE chat_id=? AND day>=?",
+            (message.chat.id, start),
+        ).fetchone()["n"]
+        period_text = {
+            "day": "С начала сегодняшнего дня",
+            "week": "С понедельника этой недели",
+            "month": "С первого числа этого месяца",
+        }[period]
+    conn.close()
+
+    lines = [
+        f"<b>{title}</b>",
+        "",
+        f"🕐 <i>{period_text}</i>",
+        f"💬 Всего сообщений за период: <b>{int(total_chat):,}</b>",
+        "",
+    ]
+
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(rows, 1):
+        raw_label = ("@" + r["username"]) if r["username"] else (r["first_name"] or "Пользователь")
+        label = _mention_user(message.chat.id, int(r["user_id"]), raw_label)
+        prefix = medals[i - 1] if i <= 3 else f"{i}."
+        lines.append(f"{prefix} {label} — <b>{int(r['messages']):,}</b> сообщ.")
+
+    bot.send_message(message.chat.id, "\n".join(lines))
 
 
-@bot.message_handler(commands=["topday", "topweek", "topmonth"])
+@bot.message_handler(commands=["topday", "topweek", "topmonth", "топдня", "топнедели", "топмесяца"])
 def handle_social_top_period_command(message: Message) -> None:
     cmd=(message.text or "").split()[0].lower().lstrip("/")
-    handle_social_top(message,{"topday":"day","topweek":"week","topmonth":"month"}[cmd])
+    handle_social_top(message,{"topday":"day","topweek":"week","topmonth":"month","топдня":"day","топнедели":"week","топмесяца":"month"}[cmd])
 
 
 @bot.message_handler(commands=["commands", "команды"])
 def handle_social_commands(message: Message) -> None:
-    text = (
-        "📚 <b>Команды Berlions</b>\n\n"
-        "👤 <b>Профиль и общение</b>\n"
-        "• <code>профиль</code> — твой профиль\n"
-        "• <code>профиль @user</code> — профиль пользователя\n"
-        "• <code>награды</code> — твои награды\n"
-        "• <code>награды @user</code> — награды пользователя\n"
-        "• <code>наградить @user причина</code> — выдать награду\n"
-        "• <code>поцеловать @user</code> / ответом — поцеловать\n"
-        "• <code>обнять @user</code> / ответом — обнять\n"
-        "• <code>дай пять @user</code> / ответом — дать пять\n\n"
+    text=(
+        "📚 <b>Команды Berlions</b> ✨\n\n"
+        "👤 <b>Профиль</b>\n"
+        "• <code>/профиль</code> — профиль и статистика\n"
+        "• <code>/награды</code> — награды\n"
+        "• <code>/команды</code> — этот список\n\n"
         "💍 <b>Отношения</b>\n"
-        "• <code>брак @user</code> / ответом — предложение брака\n"
-        "• <code>браки</code> — статистика браков\n\n"
+        "• <code>/брак @user</code> — предложить брак\n"
+        "• <code>/браки</code> — список браков\n"
+        "• <code>/развод</code> — развестись\n\n"
         "🏰 <b>Кланы</b>\n"
-        "• <code>создать клан Название</code>\n"
-        "• <code>+клан Название</code>\n"
-        "• <code>кланы</code> — список кланов\n\n"
+        "• <code>/создать_клан Название</code> — создать клан\n"
+        "• <code>/кланы</code> — кланы и участники\n"
+        "• <code>/мой_клан</code> — управление своим кланом\n"
+        "• <code>/кик_из_клана @user</code> — исключить участника (владелец)\n"
+        "• <code>/удалить_клан</code> — удалить свой клан\n\n"
+        "💗 <b>Ролевые действия</b>\n"
+        "• <code>поцеловать @user</code> — можно ответом на сообщение\n"
+        "• <code>обнять @user</code>\n"
+        "• <code>дай пять @user</code>\n"
+        "• <code>погладить @user</code>\n"
+        "• <code>пожать руку @user</code>\n"
+        "• <code>напоить @user</code>\n"
+        "• <code>накормить @user</code> / <code>покормить @user</code>\n"
+        "• <code>позвать на ужин @user</code>\n"
+        "• <code>засосать @user</code>\n"
+        "• <code>ударить @user</code>\n\n"
         "🏆 <b>Активность</b>\n"
-        "• <code>топ</code> — общий топ\n"
+        "• <code>топ</code> — общий топ и все сообщения чата\n"
         "• <code>топ дня</code>\n"
         "• <code>топ неделя</code>\n"
         "• <code>топ месяц</code>\n\n"
-        "💰 <b>Биржа</b>\n"
-        "• <code>/market</code> • <code>/balance</code> • <code>/bonus</code>\n"
-        "• <code>/portfolio</code> • <code>/buy</code> • <code>/sell</code>\n"
-        "• <code>/exchange</code> • <code>/exchanges</code>\n\n"
-        "🎲 <code>/dice</code> — кости\n"
-        "🔎 <code>/search запрос</code> — поиск"
+        "🎲 <code>/кости</code> — кости\n"
+        "🔎 <code>/поиск запрос</code> — поиск\n\n"
+        "💡 Основные функции доступны через меню-кнопки под полем ввода."
     )
     bot.send_message(message.chat.id,text)
 
@@ -2313,6 +1730,9 @@ def handle_social_marry_plain(message: Message) -> None:
 
 @bot.message_handler(func=lambda m: bool(m.text and re.match(r"^наградить(?:\s+.+)?$",m.text.strip(),re.I)), content_types=["text"])
 def handle_social_award(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id,"⛔ Награждать может только администратор.")
+        return
     parts=message.text.strip().split(maxsplit=2)
     if message.reply_to_message and message.reply_to_message.from_user:
         target=_social_target(message,"")
@@ -2331,6 +1751,7 @@ def handle_social_award(message: Message) -> None:
     bot.send_message(message.chat.id,f"🏆 {_social_user_label(message.chat.id,target)} <b>награждён!</b>\n🎖 Причина: <i>{html.escape(reason)}</i>")
 
 
+@bot.message_handler(commands=["создать_клан"])
 @bot.message_handler(func=lambda m: bool(m.text and re.match(r"^создать\s+клан\s+.+$",m.text.strip(),re.I)), content_types=["text"])
 def handle_social_create_clan(message: Message) -> None:
     name=message.text.strip().split(None,2)[2].strip()
@@ -2356,6 +1777,9 @@ def handle_social_join_clan(message: Message) -> None:
     conn=_social_db(); clan=conn.execute("SELECT id,name FROM social_clans WHERE chat_id=? AND name_key=?",(message.chat.id,key)).fetchone()
     if not clan:
         conn.close(); bot.send_message(message.chat.id,"❌ Такой клан не найден. Посмотри список: <code>кланы</code>"); return
+    banned=conn.execute("SELECT 1 FROM social_clan_bans WHERE chat_id=? AND clan_id=? AND user_id=?",(message.chat.id,clan['id'],message.from_user.id)).fetchone()
+    if banned:
+        conn.close(); bot.send_message(message.chat.id,"🚫 Владелец этого клана запретил тебе вступать в него."); return
     old=conn.execute("SELECT clan_id FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,message.from_user.id)).fetchone()
     if old and old['clan_id']==clan['id']:
         conn.close(); bot.send_message(message.chat.id,"🏰 Ты уже в этом клане!"); return
@@ -2363,6 +1787,85 @@ def handle_social_join_clan(message: Message) -> None:
     conn.execute("INSERT INTO social_clan_members(chat_id,clan_id,user_id,joined_at) VALUES(?,?,?,?)",(message.chat.id,clan['id'],message.from_user.id,_social_now().isoformat(sep=" ")))
     conn.commit(); conn.close()
     bot.send_message(message.chat.id,f"🏰 Добро пожаловать в клан <b>{html.escape(clan['name'])}</b>!")
+
+
+@bot.message_handler(commands=["развод"])
+def handle_social_divorce(message: Message) -> None:
+    target=None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target=message.reply_to_message.from_user.id
+    else:
+        arg=" ".join((message.text or "").split()[1:])
+        target=_social_target(message,arg)
+    conn=_social_db()
+    marriage=_social_active_marriage(conn,message.chat.id,message.from_user.id)
+    if not marriage:
+        conn.close(); bot.send_message(message.chat.id,"💔 У тебя нет активного брака."); return
+    spouse=int(marriage["user2"] if int(marriage["user1"])==message.from_user.id else marriage["user1"])
+    if target and target!=spouse and not _is_admin(message.from_user.id):
+        conn.close(); bot.send_message(message.chat.id,"💔 Укажи своего супруга или ответь на его сообщение."); return
+    conn.execute("UPDATE social_marriages SET active=0 WHERE id=?",(marriage["id"],)); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"💔 {_social_user_label(message.chat.id,message.from_user.id)} и {_social_user_label(message.chat.id,spouse)} больше не состоят в браке.")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"развод(?:\s+@\w+)?",m.text.strip(),re.I)), content_types=["text"])
+def handle_social_divorce_plain(message: Message) -> None:
+    handle_social_divorce(message)
+
+
+@bot.message_handler(commands=["мой_клан", "управление_кланом"])
+def handle_my_clan(message: Message) -> None:
+    conn=_social_db()
+    clan=conn.execute("SELECT c.* FROM social_clans c JOIN social_clan_members m ON m.clan_id=c.id WHERE c.chat_id=? AND m.user_id=?",(message.chat.id,message.from_user.id)).fetchone()
+    if not clan:
+        conn.close(); bot.send_message(message.chat.id,"🏰 Ты пока не состоишь в клане."); return
+    members=conn.execute("SELECT user_id,joined_at FROM social_clan_members WHERE chat_id=? AND clan_id=? ORDER BY joined_at",(message.chat.id,clan["id"])).fetchall()
+    bans=conn.execute("SELECT user_id FROM social_clan_bans WHERE chat_id=? AND clan_id=?",(message.chat.id,clan["id"])).fetchall()
+    conn.close()
+    lines=[f"🏰 <b>{html.escape(clan['name'])}</b>",f"👑 Владелец: {_social_user_label(message.chat.id,int(clan['owner_id']))}",f"👥 Участников: <b>{len(members)}</b>","","<b>Участники:</b>"]
+    for m in members: lines.append(f"• {_social_user_label(message.chat.id,int(m['user_id']))}")
+    if int(clan["owner_id"])==message.from_user.id:
+        lines += ["", "⚙️ <b>Управление владельца:</b>","/кик_из_клана @user — исключить и запретить повторный вход","/удалить_клан — удалить клан"]
+        if bans: lines.append(f"🚫 Заблокировано в клане: <b>{len(bans)}</b>")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"мой\s+клан",m.text.strip(),re.I)), content_types=["text"])
+def handle_my_clan_plain(message: Message) -> None:
+    handle_my_clan(message)
+
+
+def _clan_owner_for_user(conn, chat_id, user_id):
+    return conn.execute("SELECT c.* FROM social_clans c JOIN social_clan_members m ON m.clan_id=c.id WHERE c.chat_id=? AND m.user_id=?",(chat_id,user_id)).fetchone()
+
+
+@bot.message_handler(commands=["кик_из_клана"])
+def handle_clan_kick(message: Message) -> None:
+    if not _is_admin(message.from_user.id) and not message.reply_to_message and len((message.text or "").split())<2:
+        bot.send_message(message.chat.id,"❓ Формат: <code>/кик_из_клана @user</code> или ответом на сообщение."); return
+    target=message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else _social_target(message," ".join((message.text or "").split()[1:]))
+    if not target: bot.send_message(message.chat.id,"❓ Не удалось определить пользователя."); return
+    conn=_social_db(); clan=_clan_owner_for_user(conn,message.chat.id,message.from_user.id)
+    if not clan and not _is_admin(message.from_user.id): conn.close(); bot.send_message(message.chat.id,"⛔ Только владелец клана может исключать участников."); return
+    if clan and target==int(clan["owner_id"]): conn.close(); bot.send_message(message.chat.id,"❌ Нельзя исключить владельца клана."); return
+    target_clan=conn.execute("SELECT clan_id FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,target)).fetchone()
+    if not target_clan or (clan and int(target_clan["clan_id"])!=int(clan["id"])):
+        conn.close(); bot.send_message(message.chat.id,"❌ Пользователь не состоит в твоём клане."); return
+    cid=int(target_clan["clan_id"]); conn.execute("DELETE FROM social_clan_members WHERE chat_id=? AND user_id=?",(message.chat.id,target)); conn.execute("INSERT OR REPLACE INTO social_clan_bans(chat_id,clan_id,user_id,banned_at) VALUES(?,?,?,?)",(message.chat.id,cid,target,_social_now().isoformat(sep=" "))); conn.commit(); conn.close()
+    bot.send_message(message.chat.id,f"🚫 {_social_user_label(message.chat.id,target)} исключён из клана и больше не сможет в него вступить.")
+
+
+@bot.message_handler(commands=["удалить_клан"])
+def handle_delete_clan(message: Message) -> None:
+    conn=_social_db(); clan=_clan_owner_for_user(conn,message.chat.id,message.from_user.id)
+    if not clan and not _is_admin(message.from_user.id): conn.close(); bot.send_message(message.chat.id,"⛔ Только владелец клана может удалить его."); return
+    if clan:
+        cid=int(clan["id"]); conn.execute("DELETE FROM social_clan_members WHERE chat_id=? AND clan_id=?",(message.chat.id,cid)); conn.execute("DELETE FROM social_clan_bans WHERE chat_id=? AND clan_id=?",(message.chat.id,cid)); conn.execute("DELETE FROM social_clans WHERE id=?",(cid,))
+    else:
+        # глобальный админ: удаление клана, в котором он состоит, либо ничего
+        cidrow=conn.execute("SELECT id FROM social_clans WHERE chat_id=? AND owner_id=?",(message.chat.id,message.from_user.id)).fetchone()
+        if cidrow: cid=int(cidrow["id"]); conn.execute("DELETE FROM social_clan_members WHERE clan_id=?",(cid,)); conn.execute("DELETE FROM social_clan_bans WHERE clan_id=?",(cid,)); conn.execute("DELETE FROM social_clans WHERE id=?",(cid,))
+    conn.commit(); conn.close(); bot.send_message(message.chat.id,"🗑 Клан удалён.")
 
 
 @bot.message_handler(commands=["marry", "брак"])
@@ -2384,6 +1887,127 @@ def handle_social_marry_command(message: Message) -> None:
     proposal_id=cur.lastrowid; conn.commit(); conn.close()
     markup=InlineKeyboardMarkup(row_width=2).add(InlineKeyboardButton("💍 Согласиться",callback_data=f"marry_yes:{proposal_id}"),InlineKeyboardButton("❌ Отказаться",callback_data=f"marry_no:{proposal_id}"))
     bot.send_message(message.chat.id,f"💍 {_social_user_label(message.chat.id,message.from_user.id)} предлагает брак {_social_user_label(message.chat.id,target)}!\n\nСогласие второго пользователя обязательно.",reply_markup=markup)
+
+
+def _play_dice_legacy(chat_id: int, user_id: int) -> None:
+    now = time.time()
+    last_roll = _dice_cooldown.get(user_id, 0)
+    if now - last_roll < 60:
+        bot.send_message(chat_id, f"⏳ Подожди {int(60 - (now - last_roll))} секунд перед следующим броском!")
+        return
+    if not _require_subscription(chat_id, user_id, "dice"):
+        return
+    _dice_cooldown[user_id] = now
+    try:
+        sent = bot.send_dice(chat_id, emoji="🎲")
+        value = getattr(sent.dice, "value", None)
+        if value is not None:
+            bot.send_message(chat_id, f"🎲 Выпало: <b>{value}</b>")
+    except Exception:
+        logger.exception("Dice callback error")
+        bot.send_message(chat_id, "❌ Не удалось бросить кости. Попробуй ещё раз.")
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and (
+    call.data.startswith("verify:") or call.data.startswith("search_pick:") or call.data == "play_dice" or
+    call.data.startswith("order_vote:") or call.data.startswith("order_open:") or call.data.startswith("orders_page:") or
+    call.data.startswith("order_close:") or call.data == "orders_noop" or call.data.startswith("marry_yes:") or call.data.startswith("marry_no:")
+)))
+def handle_bot_callbacks(call: CallbackQuery) -> None:
+    try:
+        data = call.data or ""
+        if data.startswith("verify:"):
+            context = data[len("verify:"):]
+            if not _is_subscribed(call.from_user.id):
+                bot.answer_callback_query(call.id, "❌ Сначала подпишись на канал и чат.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception: pass
+            if context == "dice":
+                _play_dice_legacy(call.message.chat.id, call.from_user.id)
+            elif context.startswith("key:"):
+                row = database.get_link(context[len("key:"):])
+                if row: _deliver_link(call.message.chat.id, row)
+                else: bot.send_message(call.message.chat.id, "❌ Ссылка не найдена.")
+            return
+        if data.startswith("search_pick:"):
+            key = data[len("search_pick:"):]
+            if not _require_subscription(call.message.chat.id, call.from_user.id, "search"):
+                bot.answer_callback_query(call.id, "🔒 Нужна подписка.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id)
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception: pass
+            row = database.get_link(key)
+            if row: _deliver_link(call.message.chat.id, row)
+            else: bot.send_message(call.message.chat.id, "❌ Контент не найден.")
+            return
+        if data == "play_dice":
+            bot.answer_callback_query(call.id)
+            _play_dice_legacy(call.message.chat.id, call.from_user.id)
+            return
+        if data == "orders_noop":
+            bot.answer_callback_query(call.id)
+            return
+        if data.startswith("orders_page:"):
+            page = max(0, int(data.split(":",1)[1]))
+            bot.answer_callback_query(call.id)
+            # Редактируем список, чтобы чат не засорялся.
+            _edit_orders_list(call.message.chat.id, call.message.message_id, page)
+            return
+        if data.startswith("order_open:"):
+            request_id = int(data.split(":",1)[1])
+            bot.answer_callback_query(call.id)
+            detail_markup = _order_keyboard(request_id)
+            if _is_admin(call.from_user.id):
+                detail_markup.add(InlineKeyboardButton("✅ Игра добавлена — закрыть заявку", callback_data=f"order_close:{request_id}"))
+            bot.edit_message_text(_request_summary(request_id) + "\n\nЕсли игра тебе нужна — голосуй:", call.message.chat.id, call.message.message_id, reply_markup=detail_markup)
+            return
+        if data.startswith("order_close:"):
+            if not _is_admin(call.from_user.id):
+                bot.answer_callback_query(call.id, "⛔ Только администратор.", show_alert=True)
+                return
+            request_id = int(data.split(":",1)[1])
+            conn = _orders_db()
+            conn.execute("UPDATE game_requests SET status='closed',updated_at=? WHERE id=?", (datetime.now().isoformat(timespec="seconds"), request_id))
+            conn.commit(); conn.close()
+            bot.answer_callback_query(call.id, "✅ Заявка закрыта.")
+            _edit_orders_list(call.message.chat.id, call.message.message_id, 0)
+            return
+        if data.startswith("order_vote:"):
+            _, sign, raw_id = data.split(":",2)
+            request_id = int(raw_id)
+            vote = 1 if sign == "+" else -1
+            conn = _orders_db()
+            exists = conn.execute("SELECT id FROM game_requests WHERE id=? AND status='open'", (request_id,)).fetchone()
+            if not exists:
+                conn.close(); bot.answer_callback_query(call.id, "Заявка уже закрыта.", show_alert=True); return
+            now = datetime.now().isoformat(timespec="seconds")
+            old = conn.execute("SELECT vote FROM game_request_votes WHERE request_id=? AND user_id=?", (request_id, call.from_user.id)).fetchone()
+            if old and int(old['vote']) == vote:
+                conn.execute("DELETE FROM game_request_votes WHERE request_id=? AND user_id=?", (request_id, call.from_user.id))
+                message = "Голос убран."
+            else:
+                conn.execute("INSERT INTO game_request_votes(request_id,user_id,vote,updated_at) VALUES(?,?,?,?) ON CONFLICT(request_id,user_id) DO UPDATE SET vote=excluded.vote,updated_at=excluded.updated_at", (request_id,call.from_user.id,vote,now))
+                message = "👍 Учтено!" if vote == 1 else "👎 Учтено!"
+            conn.commit(); conn.close()
+            bot.answer_callback_query(call.id, message)
+            try:
+                refresh_markup = _order_keyboard(request_id)
+                if _is_admin(call.from_user.id):
+                    refresh_markup.add(InlineKeyboardButton("✅ Игра добавлена — закрыть заявку", callback_data=f"order_close:{request_id}"))
+                bot.edit_message_text(_request_summary(request_id) + "\n\nЕсли игра тебе нужна — голосуй:", call.message.chat.id, call.message.message_id, reply_markup=refresh_markup)
+            except Exception:
+                pass
+            return
+        if data.startswith("marry_yes:") or data.startswith("marry_no:"):
+            handle_social_marriage_callback(call)
+            return
+    except Exception:
+        logger.exception("Bot callback error")
+        try: bot.answer_callback_query(call.id, "❌ Ошибка. Попробуй ещё раз.", show_alert=True)
+        except Exception: pass
 
 
 def handle_social_marriage_callback(call: CallbackQuery) -> None:
@@ -2408,40 +2032,562 @@ def handle_social_marriage_callback(call: CallbackQuery) -> None:
         except Exception: pass
 
 
-@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^(поцеловать|поцеловал|поцеловала|обнять|обнял|обняла|дай пять|дать пять|погладить|пожать руку)\b",m.text.strip(),re.I)), content_types=["text"])
+@bot.message_handler(
+    func=lambda m: bool(
+        m.text and re.match(
+            r"^(поцеловать|обнять|дай пять|дать пять|погладить|пожать руку|"
+            r"напоить|накормить|покормить|позвать на ужин|засосать|ударить)\b",
+            m.text.strip(),
+            re.I,
+        )
+    ),
+    content_types=["text"],
+)
 def handle_social_roleplay(message: Message) -> None:
-    parts=message.text.strip().split(maxsplit=1)
-    action=parts[0].lower()
-    target=_social_target(message,parts[1] if len(parts)>1 else "")
+    raw = message.text.strip()
+    parts = raw.split(maxsplit=1)
+    action = parts[0].lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    # Многословная команда.
+    if action == "позвать" and rest.lower().startswith("на ужин"):
+        action = "позвать на ужин"
+        rest = rest[len("на ужин"):].strip()
+
+    target = _social_target(message, rest)
+
+    quote = ""
+    if message.reply_to_message and rest:
+        quote = rest
+    elif target and rest:
+        tokens = rest.split(maxsplit=1)
+        quote = tokens[1] if len(tokens) > 1 else ""
+
     if not target:
-        bot.send_message(message.chat.id,f"💫 Формат: <code>{html.escape(action)} @user</code> или просто ответь этой командой на сообщение."); return
-    target_label=_social_user_label(message.chat.id,target)
-    replies={
-        "поцеловать": f"💋 {target_label}, тебя только что поцеловали!",
-        "поцеловал": f"💋 {target_label}, тебя поцеловали!",
-        "поцеловала": f"💋 {target_label}, тебя поцеловали!",
-        "обнять": f"🤗 {target_label}, тебя крепко обняли!",
-        "обнял": f"🤗 {target_label}, тебя крепко обняли!",
-        "обняла": f"🤗 {target_label}, тебя крепко обняли!",
-        "дай пять": f"🖐 {target_label}, вам дали пять!",
-        "дать пять": f"🖐 {target_label}, вам дали пять!",
-        "погладить": f"🥰 {target_label}, тебя нежно погладили!",
-        "пожать руку": f"🤝 {target_label}, вам пожали руку!",
-    }
-    bot.send_message(message.chat.id,replies.get(action,f"✨ {target_label} — действие выполнено!"))
-
-
-@bot.message_handler(commands=["learn"])
-def handle_learn(message: Message) -> None:
-    if not _is_admin(message.from_user.id) and _get_user_rank(message.chat.id, message.from_user.id) < 5:
-        bot.send_message(message.chat.id, "⛔ Только глава или глобальный.")
+        bot.send_message(
+            message.chat.id,
+            f"{_pe('social', '💫')} <b>Формат:</b> "
+            f"<code>{html.escape(action)} @user</code> или ответом на сообщение.",
+        )
         return
-    bot.send_message(message.chat.id, "✅ /learn активирован. Полная история чата пока не поддерживается (ограничения Telegram).")
+
+    if target == message.from_user.id:
+        bot.send_message(message.chat.id, f"{_pe('social', '😄')} На себя это действие не распространяется.")
+        return
+
+    actor = _social_user_label(message.chat.id, message.from_user.id)
+    target_label = _social_user_label(message.chat.id, target)
+
+    verbs = {
+        "поцеловать": "поцеловал",
+        "обнять": "обнял",
+        "дай пять": "дал пять",
+        "дать пять": "дал пять",
+        "погладить": "погладил",
+        "пожать руку": "пожал руку",
+        "напоить": "угостил напитком",
+        "накормить": "накормил",
+        "покормить": "покормил",
+        "позвать на ужин": "позвал на ужин",
+        "засосать": "страстно поцеловал",
+        "ударить": "легонько ударил",
+    }
+    emoji_keys = {
+        "поцеловать": ("kiss", "😘"),
+        "обнять": ("hug", "🤗"),
+        "дай пять": ("highfive", "🖐️"),
+        "дать пять": ("highfive", "🖐️"),
+        "погладить": ("love", "🥰"),
+        "пожать руку": ("handshake", "🤝"),
+        "напоить": ("drink", "🥤"),
+        "накормить": ("food", "🍽️"),
+        "покормить": ("food", "🍽️"),
+        "позвать на ужин": ("dinner", "🍷"),
+        "засосать": ("kiss", "💋"),
+        "ударить": ("hit", "👊"),
+    }
+    emoji_key, fallback = emoji_keys[action]
+    text = f"{_pe(emoji_key, fallback)} | {actor} <b>{verbs[action]}</b> {target_label}"
+    if quote:
+        text += f"\nс репликой: <i>{html.escape(quote)}</i>"
+    bot.send_message(message.chat.id, text)
+
+
+
+# ── АДМИНСКИЕ КОМАНДЫ: РАССЫЛКА И МОДЕРАЦИЯ ─────────────────────────────────────
+MODERATION_DB = "moderation.db"
+BANLIST_PAGE_SIZE = 20
+
+
+def _moderation_db():
+    conn = sqlite3.connect(MODERATION_DB, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _moderation_init_db() -> None:
+    conn = _moderation_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bans (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            reason TEXT NOT NULL DEFAULT 'Не указана',
+            banned_at TEXT NOT NULL,
+            until_ts INTEGER,
+            PRIMARY KEY(chat_id, user_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'Не указана',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+_moderation_init_db()
+
+
+def _remember_broadcast_user(message: Message) -> None:
+    """Запоминаем пользователей, с которыми бот реально может связаться в ЛС."""
+    if not message.from_user or message.chat.type != "private":
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    u = message.from_user
+    conn = _moderation_db()
+    conn.execute("""
+        INSERT INTO broadcast_users(user_id,username,first_name,last_name,first_seen,last_seen)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_name=excluded.last_name,
+            last_seen=excluded.last_seen
+    """, (u.id, u.username, u.first_name or "", u.last_name or "", now, now))
+    conn.commit()
+    conn.close()
+
+
+def _mod_admin(message: Message) -> bool:
+    if not _is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ <b>Эта команда доступна только администраторам.</b>")
+        return False
+    return True
+
+
+def _mod_group(message: Message) -> bool:
+    if message.chat.type not in ("group", "supergroup"):
+        bot.send_message(message.chat.id, "⛔ <b>Эта команда работает только в группе.</b>")
+        return False
+    return True
+
+
+def _mod_target(message: Message, args: str = ""):
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+    parts = (args or "").split()
+    if not parts:
+        return None
+    token = parts[0].strip().rstrip(",.!?")
+    if token.isdigit():
+        try:
+            member = bot.get_chat_member(message.chat.id, int(token))
+            return member.user
+        except Exception:
+            return None
+    if token.startswith("@"):
+        try:
+            member = bot.get_chat_member(message.chat.id, token)
+            return member.user
+        except Exception:
+            pass
+        target_id = _social_target(message, token)
+        if target_id:
+            try:
+                member = bot.get_chat_member(message.chat.id, target_id)
+                return member.user
+            except Exception:
+                return None
+    return None
+
+
+def _mod_reason(text: str, target_token_count: int = 0) -> str:
+    parts = (text or "").split()
+    if target_token_count:
+        parts = parts[target_token_count:]
+    return " ".join(parts).strip() or "Не указана"
+
+
+def _parse_duration(text: str):
+    """Возвращает (секунды, красивый текст) для 20 дней / 5 часов / 30 минут."""
+    m = re.match(r"^\s*(\d+)\s*(мин(?:ут[а-я]*)?|ч(?:ас(?:а|ов)?)?|д(?:ень|ня|ней)?|нед(?:ел[яьи])?)\b", text or "", re.I)
+    if not m:
+        return None, None
+    amount = int(m.group(1))
+    unit = m.group(2).lower()
+    if amount <= 0:
+        return None, None
+    if unit.startswith("мин"):
+        seconds = amount * 60
+        label = f"{amount} мин."
+    elif unit.startswith("ч"):
+        seconds = amount * 3600
+        label = f"{amount} ч."
+    elif unit.startswith("нед"):
+        seconds = amount * 7 * 86400
+        label = f"{amount} нед."
+    else:
+        seconds = amount * 86400
+        label = f"{amount} дн."
+    return seconds, label
+
+
+def _mod_target_from_command(message: Message, raw: str):
+    target = _mod_target(message, raw)
+    if target:
+        return target
+    return None
+
+
+def _mod_reason_after_target_and_duration(message: Message, raw: str, has_reply: bool):
+    parts = (raw or "").split()
+    offset = 0 if has_reply else 1
+    if not has_reply:
+        if not parts:
+            return "Не указана", ""
+        offset = 1
+    duration_text = " ".join(parts[offset:])
+    duration_seconds, duration_label = _parse_duration(duration_text)
+    if duration_seconds is None:
+        return "Не указана", ""
+    dur_match = re.match(r"^\s*\d+\s*\S+\s*(.*)$", duration_text, re.I)
+    reason = (dur_match.group(1).strip() if dur_match else "") or "Не указана"
+    return reason, duration_label
+
+
+def _mod_name(user) -> str:
+    if getattr(user, "username", None):
+        return "@" + user.username
+    return user.first_name or "Пользователь"
+
+
+def _mod_bold(text: str) -> str:
+    return f"<b>{html.escape(text)}</b>"
+
+
+def _ban_user_record(chat_id: int, user, reason: str, until_ts: int | None) -> None:
+    conn = _moderation_db()
+    conn.execute("""
+        INSERT INTO bans(chat_id,user_id,username,first_name,reason,banned_at,until_ts)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(chat_id,user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            reason=excluded.reason,
+            banned_at=excluded.banned_at,
+            until_ts=excluded.until_ts
+    """, (chat_id, user.id, user.username, user.first_name or "", reason,
+          datetime.now().isoformat(timespec="seconds"), until_ts))
+    conn.commit()
+    conn.close()
+
+
+def _cleanup_expired_bans(chat_id: int) -> None:
+    now = int(time.time())
+    conn = _moderation_db()
+    conn.execute("DELETE FROM bans WHERE chat_id=? AND until_ts IS NOT NULL AND until_ts<=?", (chat_id, now))
+    conn.commit()
+    conn.close()
+
+
+def _banlist_page(chat_id: int, page: int):
+    _cleanup_expired_bans(chat_id)
+    conn = _moderation_db()
+    total = conn.execute("SELECT COUNT(*) FROM bans WHERE chat_id=?", (chat_id,)).fetchone()[0]
+    rows = conn.execute("""
+        SELECT * FROM bans WHERE chat_id=? ORDER BY banned_at DESC LIMIT ? OFFSET ?
+    """, (chat_id, BANLIST_PAGE_SIZE, page * BANLIST_PAGE_SIZE)).fetchall()
+    conn.close()
+    return rows, int(total)
+
+
+def _banlist_markup(page: int, total: int):
+    markup = InlineKeyboardMarkup()
+    pages = max(1, (total + BANLIST_PAGE_SIZE - 1) // BANLIST_PAGE_SIZE)
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("◀️", callback_data=f"banlist:{page-1}"))
+    if page + 1 < pages:
+        buttons.append(InlineKeyboardButton("▶️", callback_data=f"banlist:{page+1}"))
+    if buttons:
+        markup.row(*buttons)
+    return markup
+
+
+def _render_banlist(chat_id: int, page: int) -> str:
+    rows, total = _banlist_page(chat_id, page)
+    pages = max(1, (total + BANLIST_PAGE_SIZE - 1) // BANLIST_PAGE_SIZE)
+    lines = [f"🚫 <b>БАН-ЛИСТ</b> · страница {page + 1}/{pages}", ""]
+    if not rows:
+        lines.append("Пока здесь пусто.")
+        return "\n".join(lines)
+    for index, row in enumerate(rows, page * BANLIST_PAGE_SIZE + 1):
+        name = "@" + row["username"] if row["username"] else (row["first_name"] or f"ID {row['user_id']}")
+        if row["until_ts"]:
+            left = max(0, int(row["until_ts"]) - int(time.time()))
+            if left >= 86400:
+                until = f"{left // 86400} дн."
+            elif left >= 3600:
+                until = f"{left // 3600} ч."
+            else:
+                until = f"{max(1, left // 60)} мин."
+        else:
+            until = "навсегда"
+        lines.append(f"<b>{index}.</b> {_mod_bold(name)} — до <b>{until}</b>\n└ причина: {html.escape(row['reason'])}")
+    return "\n".join(lines)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/рассылка(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_broadcast(message: Message) -> None:
+    if not _mod_admin(message):
+        return
+    text = (message.text or "").split(maxsplit=1)
+    if len(text) < 2 or not text[1].strip():
+        bot.send_message(message.chat.id, "❓ Формат: <code>/рассылка текст сообщения</code>")
+        return
+    broadcast_text = text[1].strip()
+    conn = _moderation_db()
+    users = conn.execute("SELECT user_id FROM broadcast_users ORDER BY user_id").fetchall()
+    conn.close()
+    if not users:
+        bot.send_message(message.chat.id, "📭 <b>Пока нет пользователей, которым можно сделать рассылку.</b>")
+        return
+    sent = failed = 0
+    for row in users:
+        try:
+            bot.send_message(int(row["user_id"]), broadcast_text)
+            sent += 1
+        except Exception:
+            failed += 1
+    bot.send_message(message.chat.id, f"📢 <b>Рассылка завершена.</b>\n\n✅ Отправлено: <b>{sent}</b>\n❌ Не доставлено: <b>{failed}</b>")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/банлист(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_banlist(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    text = _render_banlist(message.chat.id, 0)
+    rows, total = _banlist_page(message.chat.id, 0)
+    bot.send_message(message.chat.id, text, reply_markup=_banlist_markup(0, total))
+
+
+def _moderation_action_message(message: Message, action: str, target, duration_label: str | None, reason: str):
+    target_name = _mod_bold(_mod_name(target))
+    reason_text = html.escape(reason or "Не указана")
+    if action == "бан":
+        duration_text = duration_label or "навсегда"
+        text = f"🚫 <b>БАН</b>\n\n{target_name} <b>заблокирован на {html.escape(duration_text)}</b>.\n<b>Причина:</b> {reason_text}"
+    elif action == "мут":
+        duration_text = duration_label or "навсегда"
+        text = f"🔇 <b>МУТ</b>\n\n{target_name} <b>лишён возможности писать на {html.escape(duration_text)}</b>.\n<b>Причина:</b> {reason_text}"
+    elif action == "варн":
+        text = f"⚠️ <b>ВАРН</b>\n\n{target_name} получил <b>предупреждение</b>.\n<b>Причина:</b> {reason_text}"
+    else:
+        text = f"👢 <b>КИК</b>\n\n{target_name} <b>исключён из чата</b>.\n<b>Причина:</b> {reason_text}"
+    bot.send_message(message.chat.id, text)
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/(бан|мут)(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_ban_mute(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    cmd, *rest = (message.text or "").split(maxsplit=1)
+    raw = rest[0] if rest else ""
+    target = _mod_target(message, raw)
+    if not target or target.id in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    reason, duration_label = _mod_reason_after_target_and_duration(message, raw, bool(message.reply_to_message))
+    if duration_label is None:
+        bot.send_message(message.chat.id, "❓ Формат: <code>/бан 20 дней причина</code> ответом на сообщение пользователя.")
+        return
+    seconds = _parse_duration(" ".join((raw.split()[0:] if not message.reply_to_message else raw.split())))[0]
+    if message.reply_to_message:
+        duration_seconds, _ = _parse_duration(raw)
+    else:
+        parts = raw.split()
+        duration_seconds, _ = _parse_duration(" ".join(parts[1:]))
+    until_ts = int(time.time()) + int(duration_seconds)
+    until_dt = __import__("datetime").datetime.fromtimestamp(until_ts, __import__("datetime").timezone.utc)
+    try:
+        if cmd.lower() == "/бан":
+            bot.ban_chat_member(message.chat.id, target.id, until_date=until_dt, revoke_messages=True)
+            _ban_user_record(message.chat.id, target, reason, until_ts)
+        else:
+            mute_permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_audios=False,
+                can_send_documents=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_video_notes=False,
+                can_send_voice_notes=False,
+                can_send_polls=False,
+                can_add_web_page_previews=False,
+            )
+            bot.restrict_chat_member(message.chat.id, target.id, until_date=until_dt, permissions=mute_permissions)
+        _moderation_action_message(message, "бан" if cmd.lower() == "/бан" else "мут", target, duration_label, reason)
+    except Exception as exc:
+        bot.send_message(message.chat.id, f"❌ <b>Не удалось применить наказание.</b>\n{html.escape(str(exc))}")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/раз(бан|мут)(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_unban_unmute(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    target = _mod_target(message, raw)
+    if not target:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на сообщение или через @username.</b>")
+        return
+    try:
+        if (message.text or "").lower().startswith("/разбан"):
+            bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
+            conn = _moderation_db(); conn.execute("DELETE FROM bans WHERE chat_id=? AND user_id=?", (message.chat.id, target.id)); conn.commit(); conn.close()
+            bot.send_message(message.chat.id, f"✅ <b>РАЗБАН</b>\n\n{_mod_bold(_mod_name(target))} <b>разблокирован.</b>")
+        else:
+            unmute_permissions = ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_add_web_page_previews=True,
+            )
+            bot.restrict_chat_member(message.chat.id, target.id, permissions=unmute_permissions)
+            bot.send_message(message.chat.id, f"🔊 <b>РАЗМУТ</b>\n\n{_mod_bold(_mod_name(target))} <b>снова может писать.</b>")
+    except Exception as exc:
+        bot.send_message(message.chat.id, f"❌ <b>Не удалось выполнить команду.</b>\n{html.escape(str(exc))}")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/варн(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_warn(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    target = _mod_target(message, raw)
+    if not target or target.id in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    if message.reply_to_message:
+        reason = raw.strip() or "Не указана"
+    else:
+        reason = " ".join(raw.split()[1:]).strip() if raw.split() and raw.split()[0].startswith("@") else raw.strip()
+        if raw.split() and raw.split()[0].isdigit():
+            reason = " ".join(raw.split()[1:]).strip()
+        reason = reason or "Не указана"
+    conn = _moderation_db()
+    conn.execute("INSERT INTO warnings(chat_id,user_id,reason,created_at) VALUES(?,?,?,?)", (message.chat.id,target.id,reason,datetime.now().isoformat(timespec="seconds")))
+    count = conn.execute("SELECT COUNT(*) FROM warnings WHERE chat_id=? AND user_id=?", (message.chat.id,target.id)).fetchone()[0]
+    conn.commit(); conn.close()
+    if count >= 3:
+        try:
+            until_ts = int(time.time()) + 7 * 86400
+            until_dt = __import__("datetime").datetime.fromtimestamp(until_ts, __import__("datetime").timezone.utc)
+            bot.ban_chat_member(message.chat.id, target.id, until_date=until_dt, revoke_messages=False)
+            _ban_user_record(message.chat.id, target, f"3/3 варнов. Последняя причина: {reason}", until_ts)
+            bot.send_message(message.chat.id, f"🚫 <b>АВТОБАН</b>\n\n{_mod_bold(_mod_name(target))} получил <b>3 варна</b> и заблокирован на <b>7 дн.</b>\n<b>Причина:</b> {html.escape(reason)}")
+        except Exception as exc:
+            bot.send_message(message.chat.id, f"⚠️ { _mod_bold(_mod_name(target)) } получил <b>{count}/3 варна</b>.\n❌ Автобан не удалось применить: {html.escape(str(exc))}")
+    else:
+        _moderation_action_message(message, "варн", target, None, reason)
+        bot.send_message(message.chat.id, f"📊 Сейчас: <b>{count}/3 варна</b>")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/снятьварн(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_remove_warn(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    target = _mod_target(message, raw)
+    if not target:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на сообщение или через @username.</b>")
+        return
+    conn = _moderation_db()
+    row = conn.execute("SELECT id FROM warnings WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT 1", (message.chat.id,target.id)).fetchone()
+    if row:
+        conn.execute("DELETE FROM warnings WHERE id=?", (row["id"],)); conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM warnings WHERE chat_id=? AND user_id=?", (message.chat.id,target.id)).fetchone()[0]
+    conn.close()
+    if not row:
+        bot.send_message(message.chat.id, f"ℹ️ У {_mod_bold(_mod_name(target))} нет варнов.")
+        return
+    bot.send_message(message.chat.id, f"✅ <b>ВАРН СНЯТ</b>\n\n{_mod_bold(_mod_name(target))} — теперь <b>{count}/3</b> варна.")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.match(r"^/кик(?:\s|$)", m.text, re.I)), content_types=["text"])
+def handle_kick(message: Message) -> None:
+    if not _mod_admin(message) or not _mod_group(message):
+        return
+    raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    target = _mod_target(message, raw)
+    if not target or target.id in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    reason = raw.strip() if message.reply_to_message else " ".join(raw.split()[1:]).strip()
+    reason = reason or "Не указана"
+    try:
+        bot.ban_chat_member(message.chat.id, target.id, revoke_messages=False)
+        bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
+        _moderation_action_message(message, "кик", target, None, reason)
+    except Exception as exc:
+        bot.send_message(message.chat.id, f"❌ <b>Не удалось исключить пользователя.</b>\n{html.escape(str(exc))}")
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("banlist:")))
+def handle_banlist_callback(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Только для админов", show_alert=True)
+        return
+    try:
+        page = max(0, int(call.data.split(":", 1)[1]))
+    except Exception:
+        bot.answer_callback_query(call.id, "Ошибка страницы", show_alert=True)
+        return
+    text = _render_banlist(call.message.chat.id, page)
+    _, total = _banlist_page(call.message.chat.id, page)
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=_banlist_markup(page, total))
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
 
 # Последний обработчик сообщений: собирает активность, не перехватывая уже обработанные команды.
 @bot.message_handler(content_types=["text"])
 def handle_social_activity_tracker(message: Message) -> None:
     try:
+        _remember_broadcast_user(message)
         _social_register(message)
     except Exception:
         logger.exception("Social activity tracker error")
