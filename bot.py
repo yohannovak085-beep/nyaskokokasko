@@ -234,11 +234,20 @@ def _send_most_wanted(chat_id: int) -> None:
         "",
     ]
     medals = ["🥇", "🥈", "🥉"]
+    # Telegram ограничивает обычное текстовое сообщение 4096 символами.
+    max_message_chars = 3900
     for i, row in enumerate(rows, 1):
         prefix = medals[i - 1] if i <= 3 else f"<b>{i}.</b>"
         n = int(row["users"])
         word = "человек" if n == 1 else ("человека" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "человек")
-        lines.append(f"{prefix} 🎮 <b>{html.escape(str(row['game_name']))}</b> — 👥 <b>{n}</b> {word}")
+        game_name = html.escape(str(row["game_name"]))
+        if len(game_name) > 180:
+            game_name = game_name[:177] + "..."
+        line = f"{prefix} 🎮 <b>{game_name}</b> — 👥 <b>{n}</b> {word}"
+        candidate = "\n".join(lines + [line])
+        if len(candidate) > max_message_chars:
+            break
+        lines.append(line)
 
     bot.send_message(chat_id, "\n".join(lines))
 
