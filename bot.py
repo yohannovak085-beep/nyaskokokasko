@@ -169,6 +169,17 @@ def _orders_init_db() -> None:
         PRIMARY KEY(game_key, user_id)
     );
     CREATE INDEX IF NOT EXISTS idx_game_search_users_game ON game_search_users(game_key);
+    CREATE TABLE IF NOT EXISTS game_search_counts (
+        game_key TEXT PRIMARY KEY,
+        game_name TEXT NOT NULL,
+        searches INTEGER NOT NULL DEFAULT 0,
+        last_at TEXT NOT NULL
+    );
+    """)
+    # Переносим старую статистику (кол-во пользователей) в новый счётчик поисков — один раз для каждой игры.
+    conn.execute("""
+        INSERT OR IGNORE INTO game_search_counts(game_key,game_name,searches,last_at)
+        SELECT game_key, MAX(game_name), COUNT(*), MAX(found_at) FROM game_search_users GROUP BY game_key
     """)
     conn.commit()
     conn.close()
@@ -207,8 +218,8 @@ def _record_game_searches(user_id: int, rows) -> None:
         conn.close()
 
 
-def _send_most_wanted(chat_id: int) -> None:
-    """Показывает топ игр по числу уникальных пользователей, нашедших их через поиск."""
+def _send_most_wanted_unique_users(chat_id: int) -> None:
+    """Старая версия (по уникальным пользователям). Оставлена, но больше не вызывается."""
     conn = _orders_db()
     rows = conn.execute("""
         SELECT game_key, MAX(game_name) AS game_name, COUNT(*) AS users, MAX(found_at) AS last_found
@@ -250,6 +261,74 @@ def _send_most_wanted(chat_id: int) -> None:
         lines.append(line)
 
     bot.send_message(chat_id, "\n".join(lines))
+
+_search_recent: dict[tuple[int, str], float] = {}
+
+
+def _record_game_search_top(user_id: int, query: str, rows) -> None:
+    """Считает поиск игры: +1 игре, которую человек реально искал (точное название, иначе первый результат).
+    Один и тот же человек не накручивает счётчик чаще раза в минуту."""
+    try:
+        if not rows:
+            return
+        q = _normalize_game_name(query)
+        top = next((r for r in rows if _normalize_game_name(str(r["content_text"])) == q), rows[0])
+        key, name = str(top["key"]), str(top["content_text"])
+        now = time.time()
+        if now - _search_recent.get((user_id, key), 0) < 60:
+            return
+        if len(_search_recent) > 5000:
+            _search_recent.clear()
+        _search_recent[(user_id, key)] = now
+        conn = _orders_db()
+        try:
+            conn.execute(
+                "INSERT INTO game_search_counts(game_key,game_name,searches,last_at) VALUES(?,?,1,?) "
+                "ON CONFLICT(game_key) DO UPDATE SET searches=searches+1, game_name=excluded.game_name, last_at=excluded.last_at",
+                (key, name, time.strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("record game search failed")
+
+
+def _send_most_wanted(chat_id: int) -> None:
+    """Топ-10 игр: название и сколько раз её искали."""
+    conn = _orders_db()
+    rows = conn.execute("""
+        SELECT game_name, searches FROM game_search_counts
+        WHERE searches > 0
+        ORDER BY searches DESC, last_at DESC, game_name COLLATE NOCASE ASC
+        LIMIT 10
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        bot.send_message(
+            chat_id,
+            "🔥 <b>Самая разыскиваемая игра</b>\n\n"
+            "Пока статистики нет. Найди игру через <code>/поиск название</code> — и она появится здесь!",
+        )
+        return
+
+    def _word(n: int) -> str:
+        if 11 <= n % 100 <= 14:
+            return "поисков"
+        return {1: "поиск", 2: "поиска", 3: "поиска", 4: "поиска"}.get(n % 10, "поисков")
+
+    lines = ["🔥 <b>САМЫЕ РАЗЫСКИВАЕМЫЕ ИГРЫ</b>", ""]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, row in enumerate(rows, 1):
+        prefix = medals[i - 1] if i <= 3 else f"<b>{i}.</b>"
+        n = int(row["searches"])
+        name = html.escape(str(row["game_name"]))
+        if len(name) > 180:
+            name = name[:177] + "..."
+        lines.append(f"{prefix} 🎮 <b>{name}</b> — 🔎 <b>{n}</b> {_word(n)}")
+    bot.send_message(chat_id, "\n".join(lines))
+
 
 def _send_main_menu(chat_id: int, text: str | None = None, private_only: bool = True) -> None:
     # Главная Reply-клавиатура Berlions должна существовать ТОЛЬКО в личке с ботом.
@@ -769,7 +848,7 @@ def handle_menu_most_wanted(message: Message) -> None:
         bot.send_message(message.chat.id, f"❌ Не удалось открыть список разыскиваемых игр.\n<code>{html.escape(str(exc))}</code>")
 
 
-@bot.message_handler(commands=["топигр", "mostwanted", "разыскиваемые"])
+@bot.message_handler(commands=["топигр", "mostwanted", "разыскиваемые", "разыскиваемая", "wanted"])
 def handle_most_wanted_command(message: Message) -> None:
     if not _require_subscription(message.chat.id, message.from_user.id, "most_wanted_cmd"):
         return
@@ -1025,6 +1104,7 @@ def handle_search(message: Message) -> None:
     # Засчитываем только те игры, которые реально показали пользователю.
     # Повторные поиски одним и тем же пользователем рейтинг не накручивают.
     _record_game_searches(message.from_user.id, filtered_rows[:15])
+    _record_game_search_top(message.from_user.id, query, filtered_rows)
 
     count = len(filtered_rows)
     
@@ -1681,7 +1761,16 @@ def handle_social_commands(message: Message) -> None:
         "• <code>накормить @user</code> / <code>покормить @user</code>\n"
         "• <code>позвать на ужин @user</code>\n"
         "• <code>засосать @user</code>\n"
-        "• <code>ударить @user</code>\n\n"
+        "• <code>ударить @user</code>\n"
+        "• <code>убить @user</code> / <code>сжечь @user</code>\n"
+        "• <code>съесть @user</code> / <code>уебать @user</code>\n"
+        "• <code>трахнуть @user</code>\n\n"
+        "📜 <b>Чат и модерация</b>\n"
+        "• <code>/правила</code> — правила чата\n"
+        "• <code>/Topa</code> — рейтинг админов\n"
+        "• <code>/админы</code> — состав администрации и ранги\n"
+        "• <code>/бан3 @user</code> — голосование за бан (ранг 2+)\n"
+        "• <code>/id</code> — узнать свой ID\n\n"
         "🏆 <b>Активность</b>\n"
         "• <code>топ</code> — общий топ и все сообщения чата\n"
         "• <code>топ дня</code>\n"
@@ -2052,7 +2141,8 @@ def handle_social_marriage_callback(call: CallbackQuery) -> None:
     func=lambda m: bool(
         m.text and re.match(
             r"^(поцеловать|обнять|дай пять|дать пять|погладить|пожать руку|"
-            r"напоить|накормить|покормить|позвать на ужин|засосать|ударить)\b",
+            r"напоить|накормить|покормить|позвать на ужин|засосать|ударить|"
+            r"убить|сжечь|съесть|уебать|трахнуть)\b",
             m.text.strip(),
             re.I,
         )
@@ -2069,6 +2159,12 @@ def handle_social_roleplay(message: Message) -> None:
     if action == "позвать" and rest.lower().startswith("на ужин"):
         action = "позвать на ужин"
         rest = rest[len("на ужин"):].strip()
+    elif action in ("дай", "дать") and rest.lower().startswith("пять"):
+        action = "дай пять"
+        rest = rest[len("пять"):].strip()
+    elif action == "пожать" and rest.lower().startswith("руку"):
+        action = "пожать руку"
+        rest = rest[len("руку"):].strip()
 
     target = _social_target(message, rest)
 
@@ -2107,6 +2203,11 @@ def handle_social_roleplay(message: Message) -> None:
         "позвать на ужин": "позвал на ужин",
         "засосать": "страстно поцеловал",
         "ударить": "легонько ударил",
+        "убить": "убил",
+        "сжечь": "сжёг",
+        "съесть": "съел",
+        "уебать": "уебал",
+        "трахнуть": "трахнул",
     }
     emoji_keys = {
         "поцеловать": ("kiss", "😘"),
@@ -2121,7 +2222,14 @@ def handle_social_roleplay(message: Message) -> None:
         "позвать на ужин": ("dinner", "🍷"),
         "засосать": ("kiss", "💋"),
         "ударить": ("hit", "👊"),
+        "убить": ("kill", "💀"),
+        "сжечь": ("burn", "🔥"),
+        "съесть": ("eat", "😋"),
+        "уебать": ("hit", "💥"),
+        "трахнуть": ("sex", "🔞"),
     }
+    if action not in verbs or action not in emoji_keys:
+        return
     emoji_key, fallback = emoji_keys[action]
     text = f"{_pe(emoji_key, fallback)} | {actor} <b>{verbs[action]}</b> {target_label}"
     if quote:
@@ -2202,8 +2310,8 @@ def _remember_broadcast_user(message: Message) -> None:
     conn.close()
 
 
-def _mod_admin(message: Message) -> bool:
-    """Проверяет право на модерацию: глобальный админ или реальный админ группы."""
+def _mod_admin_legacy(message: Message) -> bool:
+    """Старая проверка (глобальный админ или админ группы). Оставлена, но заменена _mod_admin на рангах."""
     user_id = message.from_user.id
     if user_id in ADMIN_IDS:
         return True
@@ -2452,8 +2560,11 @@ def handle_ban_mute(message: Message) -> None:
     cmd, *rest = (message.text or "").split(maxsplit=1)
     raw = rest[0] if rest else ""
     target = _mod_target(message, raw)
-    if not target or target.id in ADMIN_IDS:
+    if not target:
         bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    if _mod_protected(message, target):
+        bot.send_message(message.chat.id, "⛔ <b>Нельзя применять это к пользователю с таким же или более высоким рангом.</b>")
         return
     reason, duration_label = _mod_reason_after_target_and_duration(message, raw, bool(message.reply_to_message))
 
@@ -2499,6 +2610,7 @@ def handle_ban_mute(message: Message) -> None:
                 mute_kwargs["until_date"] = until_dt
             bot.restrict_chat_member(message.chat.id, target.id, **mute_kwargs)
         _moderation_action_message(message, "бан" if cmd.lower() == "/бан" else "мут", target, duration_label, reason)
+        _log_mod_action(message.chat.id, message.from_user.id, "бан" if cmd.lower() == "/бан" else "мут", target.id)
     except Exception as exc:
         bot.send_message(message.chat.id, f"❌ <b>Не удалось применить наказание.</b>\n{html.escape(str(exc))}")
 
@@ -2541,8 +2653,11 @@ def handle_warn(message: Message) -> None:
         return
     raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
     target = _mod_target(message, raw)
-    if not target or target.id in ADMIN_IDS:
+    if not target:
         bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    if _mod_protected(message, target):
+        bot.send_message(message.chat.id, "⛔ <b>Нельзя применять это к пользователю с таким же или более высоким рангом.</b>")
         return
     if message.reply_to_message:
         reason = raw.strip() or "Не указана"
@@ -2555,6 +2670,7 @@ def handle_warn(message: Message) -> None:
     conn.execute("INSERT INTO warnings(chat_id,user_id,reason,created_at) VALUES(?,?,?,?)", (message.chat.id,target.id,reason,datetime.now().isoformat(timespec="seconds")))
     count = conn.execute("SELECT COUNT(*) FROM warnings WHERE chat_id=? AND user_id=?", (message.chat.id,target.id)).fetchone()[0]
     conn.commit(); conn.close()
+    _log_mod_action(message.chat.id, message.from_user.id, "варн", target.id)
     if count >= 3:
         try:
             until_ts = int(time.time()) + 7 * 86400
@@ -2596,8 +2712,11 @@ def handle_kick(message: Message) -> None:
         return
     raw = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
     target = _mod_target(message, raw)
-    if not target or target.id in ADMIN_IDS:
+    if not target:
         bot.send_message(message.chat.id, "❓ <b>Укажи пользователя ответом на его сообщение или через @username.</b>")
+        return
+    if _mod_protected(message, target):
+        bot.send_message(message.chat.id, "⛔ <b>Нельзя применять это к пользователю с таким же или более высоким рангом.</b>")
         return
     reason = raw.strip() if message.reply_to_message else " ".join(raw.split()[1:]).strip()
     reason = reason or "Не указана"
@@ -2605,6 +2724,7 @@ def handle_kick(message: Message) -> None:
         bot.ban_chat_member(message.chat.id, target.id, revoke_messages=False)
         bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
         _moderation_action_message(message, "кик", target, None, reason)
+        _log_mod_action(message.chat.id, message.from_user.id, "кик", target.id)
     except Exception as exc:
         bot.send_message(message.chat.id, f"❌ <b>Не удалось исключить пользователя.</b>\n{html.escape(str(exc))}")
 
@@ -2627,6 +2747,823 @@ def handle_banlist_callback(call: CallbackQuery) -> None:
         pass
     bot.answer_callback_query(call.id)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ДОБАВЛЕНО: РАНГИ ПЕРСОНАЛА · /Topa · /правила · ГОЛОСОВАНИЕ ЗА БАН · ПРИВЕТСТВИЕ
+# Всё в этом блоке — новый код. Старые команды и функции не удалялись.
+# ══════════════════════════════════════════════════════════════════════════════
+import threading
+from types import SimpleNamespace
+
+# ── Владелец бота ─────────────────────────────────────────────────────────────
+# Укажи ID владельца (il) в переменной окружения OWNER_ID (можно несколько через запятую).
+# Свой ID можно узнать командой /id.
+# Если OWNER_ID не задан — владельцем считается первый ID из ADMIN_ID
+# (а если и его нет — первый из EXTRA_ADMIN_IDS).
+OWNER_IDS: set[int] = set()
+for _raw in os.getenv("OWNER_ID", "").split(","):
+    _raw = _raw.strip()
+    if _raw.isdigit():
+        OWNER_IDS.add(int(_raw))
+if not OWNER_IDS:
+    for _raw in ADMIN_ID_RAW.split(","):
+        _raw = _raw.strip()
+        if _raw.isdigit():
+            OWNER_IDS.add(int(_raw))
+            break
+if not OWNER_IDS and EXTRA_ADMIN_IDS:
+    OWNER_IDS.add(EXTRA_ADMIN_IDS[0])
+ADMIN_IDS.update(OWNER_IDS)  # владелец всегда имеет доступ к старым админ-командам (/add, /list, ...)
+logger.info("Owner IDs: %s", OWNER_IDS)
+
+# ── Ранги ─────────────────────────────────────────────────────────────────────
+# 0 — обычный участник
+# 1 — Модератор: варн, мут
+# 2 — Админ: + кик, бан, голосование за бан
+# 3 — Владелец: все команды + управление рангами
+RANK_NAMES = {0: "Участник", 1: "Модератор", 2: "Админ", 3: "Владелец"}
+RANK_ICONS = {1: "🛡", 2: "⚔️", 3: "👑"}
+
+# Минимальный ранг для каждой старой модераторской команды.
+# Команда, которой нет в списке, требует ранг 3 (безопаснее по умолчанию).
+MOD_COMMAND_RANK = {
+    "варн": 1, "снятьварн": 1, "мут": 1, "размут": 1,
+    "кик": 2, "бан": 2, "разбан": 2, "банлист": 2,
+    "рассылка": 3,
+}
+
+# Очки для рейтинга /Topa
+MOD_ACTION_POINTS = {"варн": 1, "мут": 2, "кик": 3, "бан": 4, "бан3": 5}
+MOD_ACTION_ICONS = {"варн": "⚠️", "мут": "🔇", "кик": "👢", "бан": "🚫", "бан3": "🗳"}
+
+# Голосование за бан (/бан3)
+VOTEBAN_DURATION = 10 * 60      # сколько секунд идёт голосование
+VOTEBAN_MIN_VOTES = 5           # минимум голосов (за + против), иначе голосование не засчитывается
+VOTEBAN_BAN_SECONDS = 0         # срок бана по итогам голосования; 0 = навсегда
+
+DEFAULT_RULES = (
+    "1. Уважайте друг друга: без оскорблений, травли и провокаций.\n"
+    "2. Без спама, флуда и рекламы без разрешения администрации.\n"
+    "3. Не публикуйте шок-контент и личные данные других людей.\n"
+    "4. Выполняйте указания администрации чата.\n"
+    "5. За нарушения — варн, мут или бан."
+)
+DEFAULT_WELCOME = (
+    "👋 Привет, {name}!\n\n"
+    "Добро пожаловать в чат <b>{chat}</b> 🎉\n"
+    "📜 Загляни в правила: /правила\n"
+    "🔎 Игры ищи командой <code>/поиск название</code>\n\n"
+    "Приятного общения!"
+)
+
+
+def _staff_init_db() -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = _moderation_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS staff_ranks (
+        user_id INTEGER PRIMARY KEY,
+        rank INTEGER NOT NULL,
+        promoted_by INTEGER,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS mod_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        admin_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        target_id INTEGER,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_mod_actions_chat ON mod_actions(chat_id, admin_id);
+    CREATE TABLE IF NOT EXISTS voteban_polls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER,
+        target_id INTEGER NOT NULL,
+        target_username TEXT,
+        target_first_name TEXT,
+        starter_id INTEGER NOT NULL,
+        starter_name TEXT,
+        reason TEXT NOT NULL DEFAULT 'Не указана',
+        created_at INTEGER NOT NULL,
+        ends_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open'
+    );
+    CREATE TABLE IF NOT EXISTS voteban_votes (
+        poll_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        vote INTEGER NOT NULL,
+        PRIMARY KEY(poll_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS welcomed_users (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        welcomed_at TEXT NOT NULL,
+        PRIMARY KEY(chat_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS bot_settings (
+        chat_id INTEGER NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY(chat_id, key)
+    );
+    """)
+    # Старые админы из ADMIN_IDS (кроме владельца) сохраняют бан/кик — получают ранг 2.
+    # INSERT OR IGNORE: если владелец уже менял им ранг, он не перезапишется.
+    for uid in ADMIN_IDS - OWNER_IDS:
+        conn.execute(
+            "INSERT OR IGNORE INTO staff_ranks(user_id,rank,promoted_by,updated_at) VALUES(?,2,NULL,?)",
+            (uid, now),
+        )
+    conn.commit()
+    conn.close()
+
+    # Все, кого бот уже видел в чатах, считаются «уже поприветствованными»,
+    # чтобы при повторном заходе бот их не встречал заново.
+    try:
+        sconn = _social_db()
+        seen = sconn.execute("SELECT chat_id,user_id FROM social_users").fetchall()
+        sconn.close()
+        conn = _moderation_db()
+        conn.executemany(
+            "INSERT OR IGNORE INTO welcomed_users(chat_id,user_id,welcomed_at) VALUES(?,?,?)",
+            [(int(r["chat_id"]), int(r["user_id"]), now) for r in seen],
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("welcomed_users seed failed")
+
+
+_staff_init_db()
+
+
+# ── Ранги: вспомогательные функции ────────────────────────────────────────────
+
+def _staff_rank(user_id: int) -> int:
+    if user_id in OWNER_IDS:
+        return 3
+    try:
+        conn = _moderation_db()
+        row = conn.execute("SELECT rank FROM staff_ranks WHERE user_id=?", (user_id,)).fetchone()
+        conn.close()
+        return int(row["rank"]) if row else 0
+    except Exception:
+        logger.exception("staff rank lookup failed")
+        return 0
+
+
+def _set_staff_rank(user_id: int, rank: int, by: int) -> int:
+    """Ставит ранг (0 = снят) и возвращает прежний."""
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = _moderation_db()
+    old = conn.execute("SELECT rank FROM staff_ranks WHERE user_id=?", (user_id,)).fetchone()
+    conn.execute(
+        "INSERT INTO staff_ranks(user_id,rank,promoted_by,updated_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET rank=excluded.rank,promoted_by=excluded.promoted_by,updated_at=excluded.updated_at",
+        (user_id, rank, by, now),
+    )
+    conn.commit()
+    conn.close()
+    return int(old["rank"]) if old else 0
+
+
+def _mod_required_rank(text: str | None) -> int:
+    m = re.match(r"^/([^\s@]+)", text or "")
+    name = m.group(1).lower() if m else ""
+    return MOD_COMMAND_RANK.get(name, 3)
+
+
+def _mod_admin(message: Message) -> bool:
+    """Проверка права на модерацию по рангу (заменяет старую проверку, она сохранена как _mod_admin_legacy)."""
+    need = _mod_required_rank(message.text)
+    rank = _staff_rank(message.from_user.id)
+    if rank >= need:
+        return True
+    bot.send_message(
+        message.chat.id,
+        f"⛔ <b>Недостаточно прав.</b>\nНужен ранг {need} — {RANK_NAMES[need]}. Твой ранг: {rank}.",
+    )
+    return False
+
+
+_BOT_ID_CACHE: int | None = None
+
+
+def _bot_id() -> int | None:
+    global _BOT_ID_CACHE
+    if _BOT_ID_CACHE is None:
+        try:
+            _BOT_ID_CACHE = int(bot.get_me().id)
+        except Exception:
+            return None
+    return _BOT_ID_CACHE
+
+
+def _mod_protected(message: Message, target) -> bool:
+    """True, если наказывать этого пользователя нельзя: бот, сам себя, владелец или ранг не ниже, чем у автора."""
+    actor = message.from_user.id
+    if target.id == actor or target.id in OWNER_IDS or target.id == _bot_id():
+        return True
+    if actor in OWNER_IDS:
+        return False
+    return _staff_rank(target.id) >= _staff_rank(actor)
+
+
+def _require_rank(message: Message, need: int) -> bool:
+    rank = _staff_rank(message.from_user.id)
+    if rank >= need:
+        return True
+    bot.send_message(
+        message.chat.id,
+        f"⛔ <b>Недостаточно прав.</b>\nНужен ранг {need} — {RANK_NAMES[need]}. Твой ранг: {rank}.",
+    )
+    return False
+
+
+def _args_after_command(message: Message) -> str:
+    parts = (message.text or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _staff_label(uid: int, chat_id: int | None = None) -> str:
+    """Кликабельное имя без обращений к Telegram API (берёт ник из базы)."""
+    name = None
+    try:
+        conn = _social_db()
+        row = conn.execute(
+            "SELECT username,first_name,last_name FROM social_users WHERE user_id=? "
+            "ORDER BY (chat_id=?) DESC, last_seen DESC LIMIT 1",
+            (uid, chat_id or 0),
+        ).fetchone()
+        conn.close()
+        if row:
+            if row["username"]:
+                name = "@" + row["username"]
+            else:
+                name = " ".join(x for x in (row["first_name"], row["last_name"]) if x).strip() or None
+    except Exception:
+        pass
+    return _mention_user(None, uid, name or f"ID {uid}")
+
+
+def _log_mod_action(chat_id: int, admin_id: int, action: str, target_id: int | None = None) -> None:
+    try:
+        conn = _moderation_db()
+        conn.execute(
+            "INSERT INTO mod_actions(chat_id,admin_id,action,target_id,created_at) VALUES(?,?,?,?,?)",
+            (chat_id, admin_id, action, target_id, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("mod action log failed")
+
+
+def _in_group(message: Message) -> bool:
+    return message.chat.type in ("group", "supergroup")
+
+
+# ── /id ───────────────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["id", "айди"])
+def handle_show_id(message: Message) -> None:
+    src = message.reply_to_message.from_user if message.reply_to_message and message.reply_to_message.from_user else message.from_user
+    bot.send_message(
+        message.chat.id,
+        f"🆔 ID пользователя: <code>{src.id}</code>\n💬 ID чата: <code>{message.chat.id}</code>",
+    )
+
+
+# ── Управление рангами (только владелец) ──────────────────────────────────────
+
+def _resolve_rank_target(message: Message, raw: str):
+    user = _mod_target(message, raw)
+    if user:
+        return user.id, user
+    return _social_target(message, raw), None
+
+
+@bot.message_handler(commands=["повысить", "promote", "понизить", "demote", "разжаловать", "dismiss", "назначить", "setrank"])
+def handle_rank_change(message: Message) -> None:
+    if not _require_rank(message, 3):
+        return
+    cmd = (message.text or "").split()[0].split("@")[0].lstrip("/").lower()
+    raw = _args_after_command(message)
+    tid, tuser = _resolve_rank_target(message, raw)
+    if not tid:
+        bot.send_message(
+            message.chat.id,
+            "❓ <b>Формат:</b>\n"
+            "<code>/повысить @user</code> — на 1 ранг выше\n"
+            "<code>/понизить @user</code> — на 1 ранг ниже\n"
+            "<code>/разжаловать @user</code> — снять все ранги\n"
+            "<code>/назначить @user 1</code> — выдать ранг 1 или 2\n\n"
+            "Можно ответом на сообщение пользователя.",
+        )
+        return
+    if tuser is not None and getattr(tuser, "is_bot", False):
+        bot.send_message(message.chat.id, "🤖 Боту ранг выдать нельзя.")
+        return
+    if tid in OWNER_IDS:
+        bot.send_message(message.chat.id, "👑 Ранг владельца изменить нельзя.")
+        return
+
+    cur = _staff_rank(tid)
+    if cmd in ("повысить", "promote"):
+        if cur >= 2:
+            bot.send_message(message.chat.id, "⚔️ У пользователя уже максимальный ранг для админа (2).")
+            return
+        new = cur + 1
+    elif cmd in ("понизить", "demote"):
+        if cur <= 0:
+            bot.send_message(message.chat.id, "ℹ️ У пользователя нет ранга.")
+            return
+        new = cur - 1
+    elif cmd in ("разжаловать", "dismiss"):
+        if cur <= 0:
+            bot.send_message(message.chat.id, "ℹ️ У пользователя нет ранга.")
+            return
+        new = 0
+    else:  # назначить
+        tokens = raw.split()
+        rank_tok = (tokens[0] if message.reply_to_message else (tokens[1] if len(tokens) > 1 else "")) if tokens else ""
+        if rank_tok not in ("0", "1", "2"):
+            if rank_tok == "3":
+                bot.send_message(message.chat.id, "👑 Ранг 3 — только владелец. Он задаётся через переменную OWNER_ID.")
+            else:
+                bot.send_message(message.chat.id, "❓ Формат: <code>/назначить @user 1</code> (ранг 0, 1 или 2).")
+            return
+        new = int(rank_tok)
+        if new == cur:
+            bot.send_message(message.chat.id, "ℹ️ У пользователя уже такой ранг.")
+            return
+
+    _set_staff_rank(tid, new, message.from_user.id)
+    label = _staff_label(tid, message.chat.id)
+    owner_label = _staff_label(message.from_user.id, message.chat.id)
+    if new == 0:
+        text = f"🚫 {owner_label} снял с должности {label} — теперь это обычный участник."
+    elif new > cur:
+        text = f"⬆️ {owner_label} повысил {label} до ранга <b>{new}</b> — {RANK_ICONS[new]} <b>{RANK_NAMES[new]}</b>."
+    else:
+        text = f"⬇️ {owner_label} понизил {label} до ранга <b>{new}</b> — {RANK_ICONS[new]} <b>{RANK_NAMES[new]}</b>."
+    bot.send_message(message.chat.id, text)
+
+
+@bot.message_handler(commands=["админы", "admins", "staff"])
+def handle_staff_list(message: Message) -> None:
+    conn = _moderation_db()
+    rows = conn.execute("SELECT user_id,rank FROM staff_ranks WHERE rank>0 ORDER BY rank DESC, updated_at ASC").fetchall()
+    conn.close()
+    cid = message.chat.id
+    lines = ["👥 <b>СОСТАВ АДМИНИСТРАЦИИ</b>", "", f"{RANK_ICONS[3]} <b>Владелец</b>"]
+    for oid in sorted(OWNER_IDS):
+        lines.append(f"• {_staff_label(oid, cid)}")
+    for rk in (2, 1):
+        members = [int(r["user_id"]) for r in rows if int(r["rank"]) == rk]
+        lines += ["", f"{RANK_ICONS[rk]} <b>{RANK_NAMES[rk]} (ранг {rk})</b>"]
+        lines += [f"• {_staff_label(uid, cid)}" for uid in members] or ["— пока никого"]
+    lines += [
+        "",
+        "<b>Права рангов:</b>",
+        "🛡 1 — /варн, /снятьварн, /мут, /размут",
+        "⚔️ 2 — всё из ранга 1 + /кик, /бан, /разбан, /банлист, /бан3 (голосование за бан)",
+        "👑 3 — все команды + /повысить, /понизить, /разжаловать, /назначить, /рассылка, /setrules, /setwelcome",
+    ]
+    bot.send_message(cid, "\n".join(lines))
+
+
+# ── /Topa — рейтинг админов ───────────────────────────────────────────────────
+
+@bot.message_handler(
+    func=lambda m: bool(m.text and re.match(r"^/(topa|топа)(?:@\w+)?(?:\s|$)", m.text, re.I)),
+    content_types=["text"],
+)
+def handle_topa(message: Message) -> None:
+    chat_id = message.chat.id if _in_group(message) else None
+    conn = _moderation_db()
+    if chat_id is not None:
+        rows = conn.execute(
+            "SELECT admin_id,action,COUNT(*) n FROM mod_actions WHERE chat_id=? GROUP BY admin_id,action", (chat_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT admin_id,action,COUNT(*) n FROM mod_actions GROUP BY admin_id,action").fetchall()
+    staff = conn.execute("SELECT user_id FROM staff_ranks WHERE rank>0").fetchall()
+    conn.close()
+
+    stats: dict[int, dict[str, int]] = {}
+    for r in rows:
+        stats.setdefault(int(r["admin_id"]), {})[str(r["action"])] = int(r["n"])
+    for r in staff:
+        stats.setdefault(int(r["user_id"]), {})
+    for oid in OWNER_IDS:
+        stats.setdefault(oid, {})
+
+    def points(acts: dict[str, int]) -> int:
+        return sum(MOD_ACTION_POINTS.get(k, 0) * v for k, v in acts.items())
+
+    ordered = sorted(
+        stats.items(),
+        key=lambda kv: (-points(kv[1]), -sum(kv[1].values()), -_staff_rank(kv[0])),
+    )[:15]
+
+    scale = " · ".join(f"{MOD_ACTION_ICONS[k]} {v}" for k, v in MOD_ACTION_POINTS.items())
+    lines = [
+        "🏅 <b>РЕЙТИНГ АДМИНОВ</b>",
+        "",
+        f"<i>Очки за действия: {scale}</i>",
+        "",
+    ]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (uid, acts) in enumerate(ordered, 1):
+        rank = _staff_rank(uid)
+        rank_text = f"{RANK_ICONS[rank]} {RANK_NAMES[rank]}" if rank > 0 else "снят с должности"
+        prefix = medals[i - 1] if i <= 3 else f"{i}."
+        details = " · ".join(
+            f"{MOD_ACTION_ICONS[k]} {acts.get(k, 0)}" for k in MOD_ACTION_POINTS
+        )
+        lines.append(f"{prefix} {_staff_label(uid, message.chat.id)} — <b>{points(acts)}</b> очк. ({rank_text})\n    {details}")
+    bot.send_message(message.chat.id, "\n".join(lines))
+
+
+# ── Настройки чата: правила и приветствие ─────────────────────────────────────
+
+def _setting_get(chat_id: int, key: str) -> str | None:
+    try:
+        conn = _moderation_db()
+        row = conn.execute("SELECT value FROM bot_settings WHERE chat_id=? AND key=?", (chat_id, key)).fetchone()
+        conn.close()
+        return str(row["value"]) if row else None
+    except Exception:
+        logger.exception("setting get failed")
+        return None
+
+
+def _setting_set(chat_id: int, key: str, value: str | None) -> None:
+    conn = _moderation_db()
+    if value is None:
+        conn.execute("DELETE FROM bot_settings WHERE chat_id=? AND key=?", (chat_id, key))
+    else:
+        conn.execute(
+            "INSERT INTO bot_settings(chat_id,key,value) VALUES(?,?,?) "
+            "ON CONFLICT(chat_id,key) DO UPDATE SET value=excluded.value",
+            (chat_id, key, value),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _settings_scope(message: Message) -> int:
+    """В группе настройки относятся к этому чату, в личке — это общие настройки по умолчанию."""
+    return message.chat.id if _in_group(message) else 0
+
+
+@bot.message_handler(commands=["rules", "правила"])
+def handle_rules(message: Message) -> None:
+    custom = _setting_get(message.chat.id, "rules") or _setting_get(0, "rules")
+    body = html.escape(custom) if custom else DEFAULT_RULES
+    bot.send_message(message.chat.id, f"📜 <b>ПРАВИЛА ЧАТА</b>\n\n{body}")
+
+
+@bot.message_handler(func=lambda m: bool(m.text and re.fullmatch(r"правила", m.text.strip(), re.I)), content_types=["text"])
+def handle_rules_plain(message: Message) -> None:
+    handle_rules(message)
+
+
+@bot.message_handler(commands=["setrules", "установить_правила"])
+def handle_set_rules(message: Message) -> None:
+    if not _require_rank(message, 3):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.send_message(
+            message.chat.id,
+            "❓ Формат: <code>/setrules текст правил</code> (можно в несколько строк)\n"
+            "Вернуть стандартные: <code>/setrules сброс</code>",
+        )
+        return
+    text = parts[1].strip()
+    scope = _settings_scope(message)
+    if text.lower() in ("сброс", "reset"):
+        _setting_set(scope, "rules", None)
+        bot.send_message(message.chat.id, "♻️ Правила сброшены на стандартные.")
+        return
+    if len(text) > 3500:
+        bot.send_message(message.chat.id, "⚠️ Правила слишком длинные (максимум 3500 символов).")
+        return
+    _setting_set(scope, "rules", text)
+    bot.send_message(message.chat.id, "✅ Правила сохранены. Посмотреть: /правила")
+
+
+@bot.message_handler(commands=["setwelcome", "приветствие"])
+def handle_set_welcome(message: Message) -> None:
+    if not _require_rank(message, 3):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.send_message(
+            message.chat.id,
+            "❓ Формат: <code>/setwelcome текст</code>\n"
+            "В тексте можно использовать <code>{name}</code> (ник новичка) и <code>{chat}</code> (название чата).\n"
+            "Вернуть стандартное: <code>/setwelcome сброс</code>",
+        )
+        return
+    text = parts[1].strip()
+    scope = _settings_scope(message)
+    if text.lower() in ("сброс", "reset"):
+        _setting_set(scope, "welcome", None)
+        bot.send_message(message.chat.id, "♻️ Приветствие сброшено на стандартное.")
+        return
+    if len(text) > 1500:
+        bot.send_message(message.chat.id, "⚠️ Приветствие слишком длинное (максимум 1500 символов).")
+        return
+    _setting_set(scope, "welcome", text)
+    bot.send_message(message.chat.id, "✅ Приветствие сохранено.")
+
+
+# ── Приветствие новых участников (один раз на человека, без сообщений о выходе) ─
+
+def _welcome_text(chat_id: int, names_html: str, chat_title: str) -> str:
+    custom = _setting_get(chat_id, "welcome") or _setting_get(0, "welcome")
+    template = html.escape(custom) if custom else DEFAULT_WELCOME
+    return template.replace("{name}", names_html).replace("{chat}", html.escape(chat_title or "чат"))
+
+
+@bot.message_handler(content_types=["new_chat_members"])
+def handle_new_members(message: Message) -> None:
+    try:
+        if not _in_group(message):
+            return
+        humans = [u for u in (message.new_chat_members or []) if not getattr(u, "is_bot", False)]
+        if not humans:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+
+        # Записываем новичков в социальную базу (для профиля «В чате: ...»).
+        sconn = _social_db()
+        for u in humans:
+            sconn.execute(
+                "INSERT OR IGNORE INTO social_users(chat_id,user_id,username,first_name,last_name,first_seen,last_seen) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (message.chat.id, u.id, (u.username or "").lower() or None, u.first_name or "", u.last_name or "", now, now),
+            )
+        sconn.commit()
+        sconn.close()
+
+        # Кого видим впервые — того и приветствуем.
+        fresh = []
+        conn = _moderation_db()
+        for u in humans:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO welcomed_users(chat_id,user_id,welcomed_at) VALUES(?,?,?)",
+                (message.chat.id, u.id, now),
+            )
+            if cur.rowcount:
+                fresh.append(u)
+        conn.commit()
+        conn.close()
+        if not fresh:
+            return
+
+        names = ", ".join(
+            _mention_user(None, u.id, ("@" + u.username) if u.username else (u.first_name or "друг"))
+            for u in fresh
+        )
+        bot.send_message(message.chat.id, _welcome_text(message.chat.id, names, message.chat.title or ""))
+    except Exception:
+        logger.exception("Welcome handler error")
+
+
+# ── Голосование за бан: /бан3 ─────────────────────────────────────────────────
+
+def _vb_name(username: str | None, first_name: str | None) -> str:
+    return ("@" + username) if username else (first_name or "Пользователь")
+
+
+def _voteban_counts(poll_id: int) -> tuple[int, int]:
+    conn = _moderation_db()
+    rows = conn.execute("SELECT vote,COUNT(*) n FROM voteban_votes WHERE poll_id=? GROUP BY vote", (poll_id,)).fetchall()
+    conn.close()
+    yes = sum(int(r["n"]) for r in rows if int(r["vote"]) == 1)
+    no = sum(int(r["n"]) for r in rows if int(r["vote"]) == -1)
+    return yes, no
+
+
+def _voteban_markup(poll_id: int, yes: int, no: int) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton(f"✅ Забанить · {yes}", callback_data=f"vb:y:{poll_id}"),
+        InlineKeyboardButton(f"❌ Не банить · {no}", callback_data=f"vb:n:{poll_id}"),
+    )
+    markup.add(InlineKeyboardButton("⏹ Завершить сейчас (админ)", callback_data=f"vb:x:{poll_id}"))
+    return markup
+
+
+def _voteban_schedule(poll_id: int, delay: float) -> None:
+    timer = threading.Timer(max(1.0, float(delay)), _voteban_finish, args=(poll_id,))
+    timer.daemon = True
+    timer.start()
+
+
+def _voteban_finish(poll_id: int) -> None:
+    try:
+        conn = _moderation_db()
+        cur = conn.execute("UPDATE voteban_polls SET status='closed' WHERE id=? AND status='open'", (poll_id,))
+        conn.commit()
+        if cur.rowcount == 0:  # уже завершено (таймер + кнопка админа)
+            conn.close()
+            return
+        poll = conn.execute("SELECT * FROM voteban_polls WHERE id=?", (poll_id,)).fetchone()
+        conn.close()
+
+        chat_id = int(poll["chat_id"])
+        yes, no = _voteban_counts(poll_id)
+        total = yes + no
+        target_id = int(poll["target_id"])
+        target_label = _mention_user(None, target_id, _vb_name(poll["target_username"], poll["target_first_name"]))
+        passed = total >= VOTEBAN_MIN_VOTES and yes > no
+
+        try:
+            if poll["message_id"]:
+                bot.edit_message_reply_markup(chat_id, int(poll["message_id"]), reply_markup=None)
+        except Exception:
+            pass
+
+        stats = f"✅ За: <b>{yes}</b> · ❌ Против: <b>{no}</b>"
+        if passed:
+            until_ts = int(time.time()) + VOTEBAN_BAN_SECONDS if VOTEBAN_BAN_SECONDS > 0 else None
+            try:
+                kwargs: dict = {"revoke_messages": False}
+                if until_ts:
+                    kwargs["until_date"] = until_ts
+                bot.ban_chat_member(chat_id, target_id, **kwargs)
+                _ban_user_record(
+                    chat_id,
+                    SimpleNamespace(id=target_id, username=poll["target_username"], first_name=poll["target_first_name"]),
+                    f"Голосование: {poll['reason']}",
+                    until_ts,
+                )
+                _log_mod_action(chat_id, int(poll["starter_id"]), "бан3", target_id)
+                text = f"🚫 <b>ГОЛОСОВАНИЕ ЗАВЕРШЕНО</b>\n\n{target_label} <b>заблокирован</b> по решению участников.\n{stats}"
+            except Exception as exc:
+                text = (
+                    f"🗳 <b>ГОЛОСОВАНИЕ ЗАВЕРШЕНО</b>\n\nУчастники решили забанить {target_label}, "
+                    f"но бот не смог этого сделать.\n{stats}\n❌ {html.escape(str(exc))}"
+                )
+        elif total < VOTEBAN_MIN_VOTES:
+            text = (
+                f"🗳 <b>ГОЛОСОВАНИЕ ЗАВЕРШЕНО</b>\n\nНе набралось голосов ({total} из {VOTEBAN_MIN_VOTES} минимум). "
+                f"{target_label} остаётся в чате.\n{stats}"
+            )
+        else:
+            text = f"🗳 <b>ГОЛОСОВАНИЕ ЗАВЕРШЕНО</b>\n\nБольшинство против бана. {target_label} остаётся в чате.\n{stats}"
+        bot.send_message(chat_id, text, reply_to_message_id=poll["message_id"], allow_sending_without_reply=True)
+    except Exception:
+        logger.exception("Voteban finish error")
+
+
+def _voteban_resume_open() -> None:
+    """После перезапуска бота возобновляет таймеры незавершённых голосований."""
+    try:
+        conn = _moderation_db()
+        rows = conn.execute("SELECT id,ends_at FROM voteban_polls WHERE status='open'").fetchall()
+        conn.close()
+        for r in rows:
+            _voteban_schedule(int(r["id"]), int(r["ends_at"]) - time.time())
+    except Exception:
+        logger.exception("Voteban resume error")
+
+
+@bot.message_handler(commands=["бан3", "voteban", "голосбан"])
+def handle_voteban_start(message: Message) -> None:
+    if not _in_group(message):
+        bot.send_message(message.chat.id, "⛔ <b>Эта команда работает только в группе.</b>")
+        return
+    if not _require_rank(message, 2):
+        return
+    raw = _args_after_command(message)
+    target = _mod_target(message, raw)
+    if not target:
+        bot.send_message(
+            message.chat.id,
+            "❓ <b>Укажи пользователя</b> ответом на его сообщение или через @username.\n"
+            "Пример: <code>/бан3 @user причина</code>",
+        )
+        return
+    if _mod_protected(message, target):
+        bot.send_message(message.chat.id, "⛔ <b>Нельзя запускать голосование против этого пользователя.</b>")
+        return
+    try:
+        status = bot.get_chat_member(message.chat.id, target.id).status
+        if status in ("creator", "administrator"):
+            bot.send_message(message.chat.id, "⛔ <b>Нельзя банить администратора чата.</b>")
+            return
+    except Exception:
+        pass
+
+    if message.reply_to_message:
+        reason = raw.strip()
+    else:
+        reason = " ".join(raw.split()[1:]).strip()
+    reason = reason[:200] or "Не указана"
+
+    conn = _moderation_db()
+    exists = conn.execute(
+        "SELECT id FROM voteban_polls WHERE chat_id=? AND target_id=? AND status='open'", (message.chat.id, target.id)
+    ).fetchone()
+    if exists:
+        conn.close()
+        bot.send_message(message.chat.id, "⏳ Голосование против этого пользователя уже идёт.")
+        return
+    now_ts = int(time.time())
+    starter_name = _social_name_from_message(message)
+    cur = conn.execute(
+        "INSERT INTO voteban_polls(chat_id,target_id,target_username,target_first_name,starter_id,starter_name,reason,created_at,ends_at,status) "
+        "VALUES(?,?,?,?,?,?,?,?,?,'open')",
+        (message.chat.id, target.id, target.username, target.first_name or "", message.from_user.id, starter_name,
+         reason, now_ts, now_ts + VOTEBAN_DURATION),
+    )
+    poll_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+
+    target_label = _mention_user(None, target.id, _vb_name(target.username, target.first_name))
+    starter_label = _mention_user(None, message.from_user.id, starter_name)
+    text = (
+        "🗳 <b>ГОЛОСОВАНИЕ ЗА БАН</b>\n\n"
+        f"👤 Участник: {target_label}\n"
+        f"🛡 Инициатор: {starter_label}\n"
+        f"📝 Причина: {html.escape(reason)}\n\n"
+        f"Нужно минимум <b>{VOTEBAN_MIN_VOTES}</b> голосов, и «за» должно быть больше, чем «против».\n"
+        f"⏳ Голосование идёт <b>{max(1, VOTEBAN_DURATION // 60)} мин.</b>"
+    )
+    sent = bot.send_message(message.chat.id, text, reply_markup=_voteban_markup(poll_id, 0, 0))
+    conn = _moderation_db()
+    conn.execute("UPDATE voteban_polls SET message_id=? WHERE id=?", (sent.message_id, poll_id))
+    conn.commit()
+    conn.close()
+    _voteban_schedule(poll_id, VOTEBAN_DURATION)
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("vb:")))
+def handle_voteban_callback(call: CallbackQuery) -> None:
+    try:
+        _, action, raw_id = call.data.split(":", 2)
+        poll_id = int(raw_id)
+        conn = _moderation_db()
+        poll = conn.execute("SELECT * FROM voteban_polls WHERE id=?", (poll_id,)).fetchone()
+        if not poll or poll["status"] != "open":
+            conn.close()
+            bot.answer_callback_query(call.id, "Голосование уже завершено.", show_alert=True)
+            return
+        uid = call.from_user.id
+
+        if action == "x":
+            conn.close()
+            if _staff_rank(uid) < 2:
+                bot.answer_callback_query(call.id, "⛔ Завершать может только админ (ранг 2+).", show_alert=True)
+                return
+            bot.answer_callback_query(call.id, "Подвожу итоги…")
+            _voteban_finish(poll_id)
+            return
+
+        if uid == int(poll["target_id"]):
+            conn.close()
+            bot.answer_callback_query(call.id, "Ты не можешь голосовать в голосовании о себе.", show_alert=True)
+            return
+        if call.from_user.is_bot:
+            conn.close()
+            return
+
+        vote = 1 if action == "y" else -1
+        old = conn.execute("SELECT vote FROM voteban_votes WHERE poll_id=? AND user_id=?", (poll_id, uid)).fetchone()
+        if old and int(old["vote"]) == vote:
+            conn.execute("DELETE FROM voteban_votes WHERE poll_id=? AND user_id=?", (poll_id, uid))
+            answer = "Голос убран."
+        else:
+            conn.execute(
+                "INSERT INTO voteban_votes(poll_id,user_id,vote) VALUES(?,?,?) "
+                "ON CONFLICT(poll_id,user_id) DO UPDATE SET vote=excluded.vote",
+                (poll_id, uid, vote),
+            )
+            answer = "✅ Голос «за» учтён." if vote == 1 else "❌ Голос «против» учтён."
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, answer)
+        yes, no = _voteban_counts(poll_id)
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=_voteban_markup(poll_id, yes, no))
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Voteban callback error")
+        try:
+            bot.answer_callback_query(call.id, "❌ Ошибка. Попробуй ещё раз.", show_alert=True)
+        except Exception:
+            pass
+
+
 # Последний обработчик сообщений: собирает активность, не перехватывая уже обработанные команды.
 @bot.message_handler(content_types=["text"])
 def handle_social_activity_tracker(message: Message) -> None:
@@ -2648,5 +3585,6 @@ if __name__ == "__main__":
         bot.remove_webhook()
     except Exception:
         logger.exception("Failed to remove webhook before polling")
+    _voteban_resume_open()
     logger.info("Bot started. Polling…")
     bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=False)
